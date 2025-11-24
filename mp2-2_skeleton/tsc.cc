@@ -11,6 +11,7 @@
 #include "client.h"
 
 #include "sns.grpc.pb.h"
+#include "coordinator.grpc.pb.h"
 #define log(severity, msg) LOG(severity) << msg; google::FlushLogFiles(google::severity);
 using grpc::Channel;
 using grpc::ClientContext;
@@ -23,6 +24,9 @@ using csce438::ListReply;
 using csce438::Request;
 using csce438::Reply;
 using csce438::SNSService;
+using csce438::CoordService;
+using csce438::ServerInfo;
+using csce438::ID;
 
 void sig_ignore(int sig) {
   std::cout << "Signal caught " + sig;
@@ -67,7 +71,7 @@ private:
   IReply List();
   IReply Follow(const std::string &username);
   IReply UnFollow(const std::string &username);
-  void   Timeline(const std::string &username);
+  IReply Timeline(const std::string &username);
 };
 
 
@@ -83,26 +87,48 @@ int Client::connectTo()
   // to call any service methods in those functions.
   // Please refer to gRpc tutorial how to create a stub.
   // ------------------------------------------------------------
-    
-  // Create channel
-  std::string server_address = hostname + ":" + port;
-  log(INFO, "Attempting to connect to server at: " + server_address);
-  
-  std::shared_ptr<Channel> channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
-  
-  // Create stub
-  stub_ = SNSService::NewStub(channel);
-  log(INFO, "gRPC stub created successfully");
-  
+
+  // Contact coordinator to get assigned server
+  std::string coord_address = hostname + ":" + port;
+  log(INFO, "Contacting coordinator at: " + coord_address);
+
+  std::shared_ptr<Channel> coord_channel = grpc::CreateChannel(coord_address, grpc::InsecureChannelCredentials());
+  std::unique_ptr<CoordService::Stub> coord_stub = CoordService::NewStub(coord_channel);
+
+  // Call GetServer RPC with user ID
+  ID client_id;
+  client_id.set_id(std::stoi(username)); // username is numeric user ID
+
+  ServerInfo server_info;
+  ClientContext context;
+
+  Status status = coord_stub->GetServer(&context, client_id, &server_info);
+
+  if (!status.ok()) {
+    log(ERROR, "Failed to get server from coordinator: " + status.error_message());
+    return -1;
+  }
+
+  log(INFO, "Coordinator assigned server: " + server_info.hostname() + ":" + server_info.port() +
+            " (Cluster " + std::to_string((std::stoi(username) - 1) % 3 + 1) +
+            ", Server " + std::to_string(server_info.serverid()) + ")");
+
+  // Connect to the assigned SNS server
+  std::string server_address = server_info.hostname() + ":" + server_info.port();
+  log(INFO, "Connecting to SNS server at: " + server_address);
+
+  std::shared_ptr<Channel> server_channel = grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  stub_ = SNSService::NewStub(server_channel);
+  log(INFO, "SNS server stub created successfully");
+
   // Test connection by calling Login
   IReply login_reply = Login();
 
-  
   if (login_reply.comm_status != SUCCESS) {
-    log(ERROR, "Connection or Login failed for user: " + username);
+    log(WARNING, "Connection or Login failed for user: " + username);
     return -1;  // Connection / Login failed
   }
-  
+
   log(INFO, "Successfully connected and logged in user: " + username);
   return 1;  // Success
 }
@@ -181,10 +207,8 @@ IReply Client::processCommand(std::string& input)
             return ire;
         }
     } else if (cmd == "TIMELINE") {
-        // Timeline command - return success, timeline mode will be handled in run()
-        ire.grpc_status = Status::OK;
-        ire.comm_status = SUCCESS;
-        return ire;
+        // Timeline command - check connection and enter timeline mode
+        return Timeline(username);
     } else {
         // Invalid command
         ire.grpc_status = Status::OK;
@@ -198,7 +222,8 @@ IReply Client::processCommand(std::string& input)
 
 void Client::processTimeline()
 {
-    Timeline(username);
+    // Timeline is now called directly from processCommand
+    // This function is kept for compatibility but does nothing
 }
 
 // List Command
@@ -240,7 +265,7 @@ IReply Client::List() {
                   std::to_string(ire.followers.size()) + " followers");
     } else {
         ire.comm_status = FAILURE_UNKNOWN;
-        log(ERROR, "List request failed for " + username + " - " + status.error_message());
+        log(WARNING, "Command failed\n");
     }
     
     return ire;
@@ -383,21 +408,22 @@ IReply Client::Login() {
         }
     } else {
         ire.comm_status = FAILURE_UNKNOWN;
-        log(ERROR, "Login failed: gRPC error for user " + username + " - " + status.error_message());
+        log(WARNING, "Login failed: gRPC error for user " + username + " - " + status.error_message());
     }
     
     return ire;
 }
 
 // Timeline Command
-void Client::Timeline(const std::string& username) {
+IReply Client::Timeline(const std::string& username) {
+    IReply ire;
     log(INFO, "Entering timeline mode for user: " + username);
 
     // ------------------------------------------------------------
     // In this function, you are supposed to get into timeline mode.
     // You may need to call a service method to communicate with
-    // the server. Use getPostMessage/displayPostMessage functions 
-    // in client.cc file for both getting and displaying messages 
+    // the server. Use getPostMessage/displayPostMessage functions
+    // in client.cc file for both getting and displaying messages
     // in timeline mode.
     // ------------------------------------------------------------
 
@@ -409,19 +435,29 @@ void Client::Timeline(const std::string& username) {
     // and you can terminate the client program by pressing
     // CTRL-C (SIGINT)
     // ------------------------------------------------------------
-  
+
     // Create context
     ClientContext context;
-    
+
     // Start bidirectional streaming
     std::shared_ptr<ClientReaderWriter<Message, Message>> stream(
         stub_->Timeline(&context));
-    
-    // Send initial message to identify ourselves
+
+    // Send initial message to identify ourselves and verify connection
     Message init_message = MakeMessage(username, "");
-    stream->Write(init_message);
+    if (!stream->Write(init_message)) {
+        log(WARNING, "Failed to send initial timeline message - server may be unavailable");
+        ire.grpc_status = Status::CANCELLED;
+        ire.comm_status = FAILURE_UNKNOWN;
+        return ire;
+    }
+
+    // Connection successful
     log(INFO, "Sent initial timeline message for user: " + username);
-    
+    log(INFO, "Now you are in the timeline");
+    ire.grpc_status = Status::OK;
+    ire.comm_status = SUCCESS;
+
     // Create a thread to handle reading messages from server
     std::thread reader_thread([&]() {
         Message server_message;
@@ -430,17 +466,17 @@ void Client::Timeline(const std::string& username) {
             displayPostMessage(server_message.username(), server_message.msg(), time);
         }
     });
-    
+
     // Create a thread to handle writing messages to server
     std::thread writer_thread([&]() {
         while (true) {
             std::string input = getPostMessage();
-            
+
             // Remove newline if present
             if (!input.empty() && input.back() == '\n') {
                 input.pop_back();
             }
-            
+
             if (!input.empty()) {
                 Message user_message = MakeMessage(username, input);
                 stream->Write(user_message);
@@ -448,23 +484,25 @@ void Client::Timeline(const std::string& username) {
             }
         }
     });
-    
+
     log(INFO, "Timeline threads started for user: " + username);
-    
+
     // Wait for the reader thread to finish (when server closes connection)
     reader_thread.join();
-    
+
     // Cleanup
     stream->WritesDone();
     Status status = stream->Finish();
-    
+
     if (!status.ok()) {
         log(ERROR, "Timeline stream error for user " + username + ": " + status.error_message());
     } else {
         log(INFO, "Timeline stream finished for user: " + username);
     }
-    
+
     // Note: writer_thread will be terminated when the program exits
+
+    return ire;
 }
 
 
@@ -476,17 +514,20 @@ int main(int argc, char** argv) {
 
   std::string hostname = "localhost";
   std::string username = "default";
-  std::string port = "3010";
-    
+  std::string port = "9090";
+
   int opt = 0;
-  while ((opt = getopt(argc, argv, "h:u:p:")) != -1){
+  while ((opt = getopt(argc, argv, "h:u:k:")) != -1){
     switch(opt) {
     case 'h':
-      hostname = optarg;break;
+      hostname = optarg;
+      break;
     case 'u':
-      username = optarg;break;
-    case 'p':
-      port = optarg;break;
+      username = optarg;
+      break;
+    case 'k':
+      port = optarg;
+      break;
     default:
       std::cout << "Invalid Command Line Argument\n";
     }

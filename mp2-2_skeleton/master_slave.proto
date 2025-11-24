@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package csce438;
+
+import "sns.proto";
+
+// Master-Slave replication service
+service MasterSlaveService {
+  rpc MirrorLogin(Request) returns (Reply) {}
+  rpc MirrorFollow(Request) returns (Reply) {}
+  rpc MirrorUnFollow(Request) returns (Reply) {}
+  rpc MirrorTimeline(stream Message) returns (stream Message) {}
+}

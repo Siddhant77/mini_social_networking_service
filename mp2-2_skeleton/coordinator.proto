@@ -22,6 +22,7 @@ service CoordService{
 
     rpc GetAllFollowerServers (ID) returns (ServerList) {}
     rpc GetFollowerServer (ID) returns (ServerInfo) {}
+    rpc GetAllSynchronizers (Empty) returns (ServerList) {}
 
 }
 
@@ -32,17 +33,22 @@ message ServerInfo{
     string port = 3;
     string type = 4;
     int32 clusterID = 5;
-    bool isMaster = 6;
+    bool is_master = 6;
 }
 
 //confirmation message definition
 message Confirmation{
     bool status = 1;
+    bool is_master = 2;
 }
 
 //id message definition
 message ID{
     int32 id = 1;
+}
+
+//empty message definition
+message Empty{
 }
 
 

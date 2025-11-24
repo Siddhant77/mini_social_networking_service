@@ -17,7 +17,7 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - .:/home/csce438/mp2_2  # Adjust the path as necessary
+      - /Users/siddhant/Developer/csce438-spring2025/mp2-2_skeleton:/home/csce438/mp2_2
     networks:
       - rabbitmq_net
     depends_on:

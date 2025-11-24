@@ -43,12 +43,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <map>
+#include <thread>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <google/protobuf/util/time_util.h>
 #include <grpc++/grpc++.h>
 #include <glog/logging.h>
 #define log(severity, msg) LOG(severity) << msg; google::FlushLogFiles(google::severity); 
 
 #include "sns.grpc.pb.h"
+#include "coordinator.grpc.pb.h"
 
 
 using google::protobuf::Timestamp;
@@ -65,7 +69,19 @@ using csce438::ListReply;
 using csce438::Request;
 using csce438::Reply;
 using csce438::SNSService;
+using csce438::CoordService;
+using csce438::ServerInfo;
+using csce438::Confirmation;
+using grpc::Channel;
+using grpc::ClientContext;
 
+// Global variables for server configuration
+std::string cluster_id_str;
+std::string server_id_str;
+std::string coordinator_hostname;
+std::string coordinator_port;
+std::string server_port;
+std::string server_directory;
 
 struct Client {
   std::string username;
@@ -93,9 +109,10 @@ Client* find_user(const std::string& username) {
   return nullptr;
 }
 
+
 // Helper function to write message to file in the required format
 void write_message_to_file(const std::string& username, const Message& message) {
-  std::string filename = username + ".txt";
+  std::string filename = server_directory + "/" + username + ".txt";
   std::ofstream file(filename, std::ios::app);
   
   if (file.is_open()) {
@@ -114,34 +131,43 @@ void write_message_to_file(const std::string& username, const Message& message) 
   }
 }
 
+// Helper function to get file modification time using stat()
+std::time_t get_file_mtime(const std::string& filename) {
+  struct stat file_stat;
+  if (stat(filename.c_str(), &file_stat) == 0) {
+    return file_stat.st_mtime;
+  }
+  return 0; // File doesn't exist or error
+}
+
 // Helper function to read last N messages from file after a specific time
 std::vector<Message> read_last_messages(const std::string& username, int count, std::time_t after_time = 0) {
   std::vector<Message> messages;
-  std::string filename = username + ".txt";
+  std::string filename = server_directory + "/" + username + ".txt";
   std::ifstream file(filename);
-  
+
   if (!file.is_open()) {
     return messages; // Return empty vector if file doesn't exist
   }
-  
+
   std::vector<std::string> lines;
   std::string line;
-  
+
   // Read all lines
   while (std::getline(file, line)) {
     lines.push_back(line);
   }
   file.close();
-  
+
   // Parse messages from the end (newest first)
   for (int i = lines.size() - 1; i >= 0 && messages.size() < count; ) {
-    if (i >= 3 && lines[i].empty() && 
+    if (i >= 3 && lines[i].empty() &&
         lines[i-1].substr(0, 2) == "W " &&
         lines[i-2].substr(0, 2) == "U " &&
         lines[i-3].substr(0, 2) == "T ") {
-      
+
       Message msg;
-      
+
       // Parse timestamp
       std::string time_str = lines[i-3].substr(2);
       google::protobuf::Timestamp* timestamp = new google::protobuf::Timestamp();
@@ -152,13 +178,13 @@ std::vector<Message> read_last_messages(const std::string& username, int count, 
       timestamp->set_seconds(message_time);
       timestamp->set_nanos(0);
       msg.set_allocated_timestamp(timestamp);
-      
+
       // Only include messages after the follow time
       if (message_time > after_time) {
         // Parse username and message
         msg.set_username(lines[i-2].substr(2));
         msg.set_msg(lines[i-1].substr(2));
-        
+
         messages.push_back(msg);
       }
       i -= 4; // Move to next message block
@@ -166,9 +192,58 @@ std::vector<Message> read_last_messages(const std::string& username, int count, 
       i--;
     }
   }
-  
+
   // Messages are already newest to oldest, no need to reverse
   return messages;
+}
+
+// Function to send a single heartbeat to the coordinator
+bool sendHeartbeat(std::unique_ptr<CoordService::Stub>& coord_stub) {
+  ServerInfo server_info;
+  server_info.set_serverid(std::stoi(server_id_str));
+  server_info.set_hostname("localhost");
+  server_info.set_port(server_port);
+  server_info.set_type("server");
+
+  Confirmation confirmation;
+  ClientContext context;
+
+  // Add cluster ID as metadata
+  context.AddMetadata("clusterid", cluster_id_str);
+
+  Status status = coord_stub->Heartbeat(&context, server_info, &confirmation);
+
+  if (status.ok() && confirmation.status()) {
+    log(INFO, "Heartbeat sent successfully to coordinator");
+    return true;
+  } else {
+    log(ERROR, "Failed to send heartbeat to coordinator: " + status.error_message());
+    return false;
+  }
+}
+
+// Thread function to periodically send heartbeats
+void heartbeatThread() {
+  // Create coordinator stub
+  std::string coord_address = coordinator_hostname + ":" + coordinator_port;
+  std::shared_ptr<Channel> channel = grpc::CreateChannel(coord_address, grpc::InsecureChannelCredentials());
+  std::unique_ptr<CoordService::Stub> coord_stub = CoordService::NewStub(channel);
+
+  log(INFO, "Heartbeat thread started, sending to coordinator at " + coord_address);
+
+  // Send initial registration heartbeat
+  if (sendHeartbeat(coord_stub)) {
+    log(INFO, "Server registered with coordinator (Cluster " + cluster_id_str +
+              ", Server " + server_id_str + ")");
+  } else {
+    log(ERROR, "Failed to register with coordinator");
+  }
+
+  // Send periodic heartbeats every 5 seconds
+  while (true) {
+    sleep(5);
+    sendHeartbeat(coord_stub);
+  }
 }
 
 
@@ -269,15 +344,15 @@ class SNSServiceImpl final : public SNSService::Service {
     // Add the relationship
     follower_client->client_following.push_back(target_client);
     target_client->client_followers.push_back(follower_client);
-    
+
     // Record the follow time
     std::time_t follow_time = std::time(nullptr);
     follower_client->follow_times[target_username] = follow_time;
-    
+
     reply->set_msg("SUCCESS");
-    log(INFO, "Follow request successful: " + follower_username + " now follows " + target_username + 
+    log(INFO, "Follow request successful: " + follower_username + " now follows " + target_username +
               " at time " + std::to_string(follow_time));
-    
+
     return Status::OK; 
   }
 
@@ -352,16 +427,16 @@ class SNSServiceImpl final : public SNSService::Service {
       // Remove the follow time record
       follower_client->follow_times.erase(target_username);
     }
-    
+
     if (!was_following) {
       reply->set_msg("FAILURE_NOT_A_FOLLOWER");
       log(INFO, "UnFollow request: " + follower_username + " was not following " + target_username);
       return Status::OK;
     }
-    
+
     reply->set_msg("SUCCESS");
     log(INFO, "UnFollow request successful: " + follower_username + " no longer follows " + target_username);
-    
+
     return Status::OK;
   }
 
@@ -369,14 +444,14 @@ class SNSServiceImpl final : public SNSService::Service {
   Status Login(ServerContext* context, const Request* request, Reply* reply) override {
     std::string username = request->username();
     log(INFO, "Login request from user: " + username);
-    
+
     // Check if username is valid (not empty)
     if (username.empty()) {
       reply->set_msg("FAILURE_INVALID_USERNAME");
       log(WARNING, "Login request with empty username");
       return Status::OK;
     }
-    
+
     // Check if user already exists and is connected
     for (Client* client : client_db) {
       if (client->username == username && client->connected) {
@@ -385,7 +460,7 @@ class SNSServiceImpl final : public SNSService::Service {
         return Status::OK;
       }
     }
-    
+
     // Check if user exists but is disconnected
     Client* existing_client = nullptr;
     for (Client* client : client_db) {
@@ -394,7 +469,7 @@ class SNSServiceImpl final : public SNSService::Service {
         break;
       }
     }
-    
+
     if (existing_client != nullptr) {
       // User exists but was disconnected, reconnect them
       existing_client->connected = true;
@@ -407,35 +482,35 @@ class SNSServiceImpl final : public SNSService::Service {
       client_db.push_back(new_client);
       log(INFO, "New user " + username + " created and connected");
     }
-    
+
     reply->set_msg("SUCCESS");
     log(INFO, "Login successful for user: " + username);
     return Status::OK;
   }
 
-  Status Timeline(ServerContext* context, 
+  Status Timeline(ServerContext* context,
 		ServerReaderWriter<Message, Message>* stream) override {
-    
+
     Message message;
     Client* user_client = nullptr;
-    
+
     // Read the first message to identify the user
     if (stream->Read(&message)) {
       std::string username = message.username();
       log(INFO, "Timeline request from user: " + username);
-      
+
       user_client = find_user(username);
       if (user_client == nullptr) {
         log(ERROR, "Timeline request from non-existent user: " + username);
         return Status::OK;
       }
-      
+
       // Set the stream for this client
       user_client->stream = stream;
-      
+
       // Send last 20 posts from users this client is following
       std::vector<Message> timeline_messages;
-      
+
       for (Client* following : user_client->client_following) {
         // Get the follow time for this user
         std::time_t follow_time = 0;
@@ -443,21 +518,21 @@ class SNSServiceImpl final : public SNSService::Service {
         if (follow_time_it != user_client->follow_times.end()) {
           follow_time = follow_time_it->second;
         }
-        
+
         // Only get messages posted after we started following this user
         std::vector<Message> user_messages = read_last_messages(following->username, 20, follow_time);
         timeline_messages.insert(timeline_messages.end(), user_messages.begin(), user_messages.end());
-        
-        log(INFO, "Retrieved " + std::to_string(user_messages.size()) + " messages from " + 
+
+        log(INFO, "Retrieved " + std::to_string(user_messages.size()) + " messages from " +
                   following->username + " after follow time " + std::to_string(follow_time));
       }
-      
+
       // Sort messages by timestamp (newest first)
-      std::sort(timeline_messages.begin(), timeline_messages.end(), 
+      std::sort(timeline_messages.begin(), timeline_messages.end(),
                 [](const Message& a, const Message& b) {
                   return a.timestamp().seconds() > b.timestamp().seconds();
                 });
-      
+
       // Send last 20 messages
       int count = 0;
       for (const Message& msg : timeline_messages) {
@@ -465,17 +540,86 @@ class SNSServiceImpl final : public SNSService::Service {
         stream->Write(msg);
         count++;
       }
-      
+
       log(INFO, "Sent " + std::to_string(count) + " timeline messages to user: " + username);
-      
+
+      // Track last modification times of followed users' timeline files
+      std::map<std::string, std::time_t> last_mtime;
+      for (Client* following : user_client->client_following) {
+        std::string filename = server_directory + "/" + following->username + ".txt";
+        last_mtime[following->username] = get_file_mtime(filename);
+      }
+
+      // Flag to control monitoring thread
+      bool timeline_active = true;
+
+      // Start file monitoring thread
+      std::thread monitor_thread([&]() {
+        while (timeline_active && user_client->stream != nullptr) {
+          sleep(5); // Check every 5 seconds
+
+          if (!timeline_active || user_client->stream == nullptr) break;
+
+          std::time_t current_time = std::time(nullptr);
+
+          for (Client* following : user_client->client_following) {
+            std::string filename = server_directory + "/" + following->username + ".txt";
+            std::time_t current_mtime = get_file_mtime(filename);
+
+            // Check if file was modified since last check
+            if (current_mtime > last_mtime[following->username]) {
+              // Check if file was modified in the last 30 seconds
+              if (difftime(current_time, current_mtime) <= 30) {
+                log(INFO, "Timeline file for " + following->username + " modified recently, re-sending posts to " + username);
+
+                // Re-send latest 20 posts from all followed users
+                std::vector<Message> updated_timeline;
+
+                for (Client* f : user_client->client_following) {
+                  std::time_t follow_time = 0;
+                  auto follow_time_it = user_client->follow_times.find(f->username);
+                  if (follow_time_it != user_client->follow_times.end()) {
+                    follow_time = follow_time_it->second;
+                  }
+
+                  std::vector<Message> user_messages = read_last_messages(f->username, 20, follow_time);
+                  updated_timeline.insert(updated_timeline.end(), user_messages.begin(), user_messages.end());
+                }
+
+                // Sort by timestamp (newest first)
+                std::sort(updated_timeline.begin(), updated_timeline.end(),
+                          [](const Message& a, const Message& b) {
+                            return a.timestamp().seconds() > b.timestamp().seconds();
+                          });
+
+                // Send latest 20 messages
+                int msg_count = 0;
+                for (const Message& msg : updated_timeline) {
+                  if (msg_count >= 20) break;
+                  if (user_client->stream != nullptr) {
+                    user_client->stream->Write(msg);
+                    msg_count++;
+                  }
+                }
+
+                log(INFO, "Re-sent " + std::to_string(msg_count) + " updated timeline messages to " + username);
+              }
+
+              // Update last modification time
+              last_mtime[following->username] = current_mtime;
+            }
+          }
+        }
+      });
+
       // Handle real-time message posting
       while (stream->Read(&message)) {
         if (message.username() == username) {
           log(INFO, "New message from " + username + ": " + message.msg());
-          
+
           // Write message to user's own file
           write_message_to_file(username, message);
-          
+
           // Broadcast to all followers who are in timeline mode
           for (Client* follower : user_client->client_followers) {
             if (follower->stream != nullptr) {
@@ -485,18 +629,29 @@ class SNSServiceImpl final : public SNSService::Service {
           }
         }
       }
-      
-      // Client disconnected from timeline
+
+      // Client disconnected from timeline - stop monitoring
+      timeline_active = false;
       user_client->stream = nullptr;
       log(INFO, "User " + username + " disconnected from timeline");
+
+      // Wait for monitoring thread to finish
+      if (monitor_thread.joinable()) {
+        monitor_thread.join();
+      }
     }
-    
+
     return Status::OK;
   }
 
 };
 
 void RunServer(std::string port_no) {
+  // Start heartbeat thread
+  std::thread hb_thread(heartbeatThread);
+  hb_thread.detach();
+  log(INFO, "Heartbeat thread launched");
+
   std::string server_address = "0.0.0.0:"+port_no;
   SNSServiceImpl service;
 
@@ -505,7 +660,8 @@ void RunServer(std::string port_no) {
   builder.RegisterService(&service);
   std::unique_ptr<Server> server(builder.BuildAndStart());
   std::cout << "Server listening on " << server_address << std::endl;
-  log(INFO, "Server listening on "+server_address);
+  log(INFO, "SNS Server listening on " + server_address +
+            " (Cluster " + cluster_id_str + ", Server " + server_id_str + ")");
 
   server->Wait();
 }
@@ -513,20 +669,52 @@ void RunServer(std::string port_no) {
 int main(int argc, char** argv) {
 
   std::string port = "3010";
-  
+  std::string cluster_id = "1";
+  std::string server_id = "1";
+  std::string coord_hostname = "localhost";
+  std::string coord_port = "9090";
+
   int opt = 0;
-  while ((opt = getopt(argc, argv, "p:")) != -1){
+  while ((opt = getopt(argc, argv, "c:s:h:k:p:")) != -1){
     switch(opt) {
+      case 'c':
+          cluster_id = optarg;
+          break;
+      case 's':
+          server_id = optarg;
+          break;
+      case 'h':
+          coord_hostname = optarg;
+          break;
+      case 'k':
+          coord_port = optarg;
+          break;
       case 'p':
-          port = optarg;break;
+          port = optarg;
+          break;
       default:
 	  std::cerr << "Invalid Command Line Argument\n";
     }
   }
-  
-  std::string log_file_name = std::string("server-") + port;
+
+  // Set global variables
+  cluster_id_str = cluster_id;
+  server_id_str = server_id;
+  coordinator_hostname = coord_hostname;
+  coordinator_port = coord_port;
+  server_port = port;
+
+  // Create server directory if it doesn't exist
+  server_directory = "server_" + cluster_id + "_" + server_id;
+  mkdir(server_directory.c_str(), 0777);
+
+  std::string log_file_name = std::string("server-") + cluster_id + "-" + server_id;
   google::InitGoogleLogging(log_file_name.c_str());
   log(INFO, "Logging Initialized. Server starting...");
+  log(INFO, "Configuration: Cluster=" + cluster_id + ", Server=" + server_id +
+            ", Coordinator=" + coord_hostname + ":" + coord_port +
+            ", Port=" + port + ", Directory=" + server_directory);
+
   RunServer(port);
 
   return 0;

@@ -50,6 +50,7 @@ namespace fs = std::filesystem;
 using csce438::AllUsers;
 using csce438::Confirmation;
 using csce438::CoordService;
+using csce438::Empty;
 using csce438::ID;
 using csce438::ServerInfo;
 using csce438::ServerList;
@@ -410,12 +411,21 @@ int main(int argc, char **argv)
 
     coordAddr = coordIP + ":" + coordPort;
     clusterID = ((synchID - 1) % 3) + 1;
+
+    // Synchronizers 1,2,3 are on Master machines; 4,5,6 are on Slave machines
+    clusterSubdirectory = (synchID <= 3) ? "1" : "2";
+
     ServerInfo serverInfo;
     serverInfo.set_hostname("localhost");
     serverInfo.set_port(port);
     serverInfo.set_type("synchronizer");
     serverInfo.set_serverid(synchID);
     serverInfo.set_clusterid(clusterID);
+
+    log(INFO, "Synchronizer " + std::to_string(synchID) + " initialized: Cluster=" + std::to_string(clusterID) +
+              ", Type=" + std::string(synchID <= 3 ? "MASTER" : "SLAVE") +
+              ", Directory=./cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory);
+
     Heartbeat(coordIP, coordPort, serverInfo, synchID);
 
     RunServer(coordIP, coordPort, port, synchID);
@@ -429,13 +439,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
     std::unique_ptr<CoordService::Stub> coord_stub_;
     coord_stub_ = std::unique_ptr<CoordService::Stub>(CoordService::NewStub(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials())));
 
-    ServerInfo msg;
-    Confirmation c;
-
-    msg.set_serverid(synchID);
-    msg.set_hostname("127.0.0.1");
-    msg.set_port(port);
-    msg.set_type("follower");
+    log(INFO, "Synchronizer runner thread started for synch " + std::to_string(synchID));
 
     // TODO: begin synchronization process
     while (true)
@@ -444,41 +448,56 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         sleep(5);
 
         grpc::ClientContext context;
-        ServerList followerServers;
-        ID id;
-        id.set_id(synchID);
+        ServerList allSynchronizers;
+        Empty empty;
 
-        // making a request to the coordinator to see count of follower synchronizers
-        coord_stub_->GetAllFollowerServers(&context, id, &followerServers);
+        // Query coordinator for all registered synchronizers
+        Status status = coord_stub_->GetAllSynchronizers(&context, empty, &allSynchronizers);
 
-        std::vector<int> server_ids;
-        std::vector<std::string> hosts, ports;
-        for (std::string host : followerServers.hostname())
-        {
-            hosts.push_back(host);
+        if (status.ok()) {
+            log(INFO, "Retrieved " + std::to_string(allSynchronizers.serverid_size()) + " synchronizers from coordinator");
+
+            std::vector<int> server_ids;
+            std::vector<std::string> hosts, ports;
+            for (std::string host : allSynchronizers.hostname()) {
+                hosts.push_back(host);
+            }
+            for (std::string p : allSynchronizers.port()) {
+                ports.push_back(p);
+            }
+            for (int serverid : allSynchronizers.serverid()) {
+                server_ids.push_back(serverid);
+            }
+
+            // Store info about other synchronizers (excluding self)
+            otherHosts.clear();
+            for (size_t i = 0; i < server_ids.size(); i++) {
+                if (server_ids[i] != synchID) {
+                    otherHosts.push_back(hosts[i] + ":" + ports[i]);
+                }
+            }
+
+            log(INFO, "Known other synchronizers: " + std::to_string(otherHosts.size()));
+        } else {
+            log(WARNING, "Failed to get synchronizers from coordinator: " + status.error_message());
         }
-        for (std::string port : followerServers.port())
-        {
-            ports.push_back(port);
+
+        // Only publish if this is a Master synchronizer
+        if (isMaster) {
+            // Publish user list
+            rabbitMQ.publishUserList();
+
+            // Publish client relations
+            rabbitMQ.publishClientRelations();
+
+            // Publish timelines
+            rabbitMQ.publishTimelines();
         }
-        for (int serverid : followerServers.serverid())
-        {
-            server_ids.push_back(serverid);
-        }
 
-        // update the count of how many follower sychronizer processes the coordinator has registered
-
-        // below here, you run all the update functions that synchronize the state across all the clusters
-        // make any modifications as necessary to satisfy the assignments requirements
-
-        // Publish user list
-        rabbitMQ.publishUserList();
-
-        // Publish client relations
-        rabbitMQ.publishClientRelations();
-
-        // Publish timelines
-        rabbitMQ.publishTimelines();
+        // All synchronizers consume messages
+        rabbitMQ.consumeUserLists();
+        rabbitMQ.consumeClientRelations();
+        rabbitMQ.consumeTimelines();
     }
     return;
 }
@@ -516,15 +535,26 @@ std::vector<std::string> get_lines_from_file(std::string filename)
 void Heartbeat(std::string coordinatorIp, std::string coordinatorPort, ServerInfo serverInfo, int syncID)
 {
     // For the synchronizer, a single initial heartbeat RPC acts as an initialization method which
-    // servers to register the synchronizer with the coordinator and determine whether it is a master
+    // registers the synchronizer with the coordinator and determines whether it is a master
 
     log(INFO, "Sending initial heartbeat to coordinator");
     std::string coordinatorInfo = coordinatorIp + ":" + coordinatorPort;
     std::unique_ptr<CoordService::Stub> stub = std::unique_ptr<CoordService::Stub>(CoordService::NewStub(grpc::CreateChannel(coordinatorInfo, grpc::InsecureChannelCredentials())));
 
-    // send a heartbeat to the coordinator, which registers your follower synchronizer as either a master or a slave
+    ClientContext context;
+    context.AddMetadata("clusterid", std::to_string(clusterID));
 
-    // YOUR CODE HERE
+    Confirmation confirmation;
+    Status status = stub->Heartbeat(&context, serverInfo, &confirmation);
+
+    if (status.ok() && confirmation.status()) {
+        isMaster = confirmation.is_master();
+        log(INFO, "Synchronizer registered with coordinator, role: " +
+                  std::string(isMaster ? "MASTER" : "SLAVE") +
+                  " (Cluster " + std::to_string(clusterID) + ", Sync " + std::to_string(syncID) + ")");
+    } else {
+        log(ERROR, "Failed to send heartbeat to coordinator: " + status.error_message());
+    }
 }
 
 bool file_contains_user(std::string filename, std::string user)

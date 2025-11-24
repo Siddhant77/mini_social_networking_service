@@ -3,6 +3,8 @@
 # need to run this command below
 # chmod +x stop.sh
 
+echo "Stopping all processes..."
+
 # Stop the coordinator
 pkill -f "./coordinator"
 

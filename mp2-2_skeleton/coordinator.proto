@@ -87,6 +87,7 @@ message ServerList{
 //potentially add a wake up synchronization rpc to be made from
 //coordinator when it detects a server reconnects after being off
 // SynchService definition
+
 service SynchService{
     rpc GetAllUsers(Confirmation) returns (AllUsers) {}
     rpc GetFollowersOfClient(ID) returns (AllUsers) {}

@@ -153,10 +153,15 @@ class CoordServiceImpl final : public CoordService::Service {
                 new_sync->port = port;
                 new_sync->last_heartbeat = getTimeNow();
 
-                // Determine if sync is on Master or Slave machine
-                // Synchronizer IDs 1,2,3 are on Master machines (server_id 1 or 2 % 2 == 1)
-                // Synchronizer IDs 4,5,6 are on Slave machines (server_id 1 or 2 % 2 == 0)
-                new_sync->is_master = (server_id <= 3);
+                // Determine master/slave based on handshake order within the cluster
+                // First synchronizer to handshake for this cluster becomes Master
+                int sync_count_in_cluster = 0;
+                for (SyncNode* sync : synchronizers) {
+                    if (sync->clusterID == cluster_id) {
+                        sync_count_in_cluster++;
+                    }
+                }
+                new_sync->is_master = (sync_count_in_cluster == 0); // True if first in cluster
                 server_is_master = new_sync->is_master;
 
                 synchronizers.push_back(new_sync);
@@ -358,6 +363,73 @@ class CoordServiceImpl final : public CoordService::Service {
         return Status::OK;
     }
 
+    Status GetAllFollowerServers(ServerContext* context, const ID* id, ServerList* serverlist) override {
+        int client_id = id->id();
+        int cluster_id = ((client_id - 1) % 3) + 1;
+
+        log(INFO, "GetAllFollowerServers request for client " + std::to_string(client_id) +
+                  " in cluster " + std::to_string(cluster_id));
+
+        v_mutex.lock();
+
+        std::vector<zNode*>* target_cluster = clusters[cluster_id - 1];
+
+        // Return all servers in the cluster (both Master and Slave)
+        for (zNode* node : *target_cluster) {
+            serverlist->add_serverid(node->serverID);
+            serverlist->add_hostname(node->hostname);
+            serverlist->add_port(node->port);
+            serverlist->add_type(node->type);
+        }
+
+        v_mutex.unlock();
+
+        log(INFO, "GetAllFollowerServers: returning " + std::to_string(serverlist->serverid_size()) +
+                  " servers for client " + std::to_string(client_id));
+        return Status::OK;
+    }
+
+    Status GetFollowerServer(ServerContext* context, const ID* id, ServerInfo* serverinfo) override {
+        int client_id = id->id();
+        int cluster_id = ((client_id - 1) % 3) + 1;
+
+        log(INFO, "GetFollowerServer request for client " + std::to_string(client_id) +
+                  " in cluster " + std::to_string(cluster_id));
+
+        v_mutex.lock();
+
+        std::vector<zNode*>* target_cluster = clusters[cluster_id - 1];
+
+        // Return the Master server in the cluster
+        zNode* master_server = nullptr;
+        for (zNode* node : *target_cluster) {
+            if (node->is_master) {
+                master_server = node;
+                break;
+            }
+        }
+
+        v_mutex.unlock();
+
+        if (master_server == nullptr) {
+            log(WARNING, "GetFollowerServer: No Master found in cluster " + std::to_string(cluster_id) +
+                         " for client " + std::to_string(client_id));
+            return Status(grpc::StatusCode::NOT_FOUND, "No Master available in cluster");
+        }
+
+        // Fill in the server information
+        serverinfo->set_serverid(master_server->serverID);
+        serverinfo->set_hostname(master_server->hostname);
+        serverinfo->set_port(master_server->port);
+        serverinfo->set_type(master_server->type);
+        serverinfo->set_clusterid(master_server->clusterID);
+        serverinfo->set_is_master(true);
+
+        log(INFO, "GetFollowerServer: returning Master " + std::to_string(master_server->serverID) +
+                  " for client " + std::to_string(client_id));
+        return Status::OK;
+    }
+
 };
 
 void RunServer(std::string port_no){
@@ -402,6 +474,7 @@ int main(int argc, char** argv) {
 
     // Initialize Google Logging
     std::string log_file_name = std::string("coordinator-") + port;
+    FLAGS_log_prefix = false;
     google::InitGoogleLogging(log_file_name.c_str());
     log(INFO, "Coordinator logging initialized on port " + port);
 
@@ -439,12 +512,25 @@ void checkHeartbeat(){
                                        " in cluster " + std::to_string(s->clusterID) +
                                        " failed. Promoting Slave.");
 
+                            int failed_cluster_id = s->clusterID;
+
                             // Find and promote the Slave in this cluster
                             for(auto& slave : *c){
                                 if(s->clusterID == slave->clusterID && slave->serverID != s->serverID && !slave->is_master){
                                     slave->is_master = true;
                                     log(INFO, "Slave server " + std::to_string(slave->serverID) +
                                               " in cluster " + std::to_string(slave->clusterID) +
+                                              " promoted to MASTER");
+                                    break;
+                                }
+                            }
+
+                            // Promote corresponding Slave synchronizer to Master synchronizer
+                            for(auto& sync : synchronizers){
+                                if(sync->clusterID == failed_cluster_id && !sync->is_master){
+                                    sync->is_master = true;
+                                    log(INFO, "Slave synchronizer " + std::to_string(sync->syncID) +
+                                              " in cluster " + std::to_string(sync->clusterID) +
                                               " promoted to MASTER");
                                     break;
                                 }

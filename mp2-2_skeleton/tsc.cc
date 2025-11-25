@@ -537,6 +537,7 @@ int main(int argc, char** argv) {
   
   // Initialize Google Logging
   std::string log_file_name = std::string("client-") + username + "-" + port;
+  FLAGS_log_prefix = false;
   google::InitGoogleLogging(log_file_name.c_str());
   log(INFO, "Client logging initialized for user: " + username);
   

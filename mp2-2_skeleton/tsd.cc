@@ -32,6 +32,8 @@
  */
 
 #include <ctime>
+#include <semaphore.h>
+#include <fcntl.h>
 
 #include <google/protobuf/timestamp.pb.h>
 #include <google/protobuf/duration.pb.h>
@@ -82,6 +84,7 @@ std::string coordinator_hostname;
 std::string coordinator_port;
 std::string server_port;
 std::string server_directory;
+std::string clusterSubdirectory; // "1" for Master, "2" for Slave
 bool is_master = false;
 std::string slave_hostname;
 std::string slave_port;
@@ -115,25 +118,181 @@ Client* find_user(const std::string& username) {
 }
 
 
+
+std::string get_sem_name(std::string file_type, std::string client) {
+  if (file_type == "users") {
+    return "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + "users";
+  } 
+  else if (file_type == "followers") {
+    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_followers";
+  } 
+  else if (file_type == "timeline") {
+    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_timeline";
+  }
+  else if (file_type == "following") {
+    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_following";
+  }
+  return ".invalid/sem/name.fuk";
+}
+
+std::string get_filepath(std::string file_type, std::string client) {
+
+  // Create server directory if it doesn't exist
+  // Use same directory structure as synchronizer: ./cluster_{clusterID}/{clusterSubdirectory}/
+  // clusterSubdirectory is "1" (Master) or "2" (Slave) based on is_master flag
+
+  std::string cluster_dir = "./cluster_" + cluster_id_str;
+  mkdir(cluster_dir.c_str(), 0777);
+
+  std::string server_directory = "./cluster_" + cluster_id_str + "/" + clusterSubdirectory + "/";
+  mkdir(server_directory.c_str(), 0777);
+
+  if (file_type == "users") {
+    return server_directory + "all_users.txt";
+  }
+  else if (file_type == "followers") {
+    return  server_directory + "_" + client + "_followers.txt";
+  }
+  else if (file_type == "timeline") {
+    return  server_directory + "_" + client + "_timeline.txt";
+  } 
+  else if (file_type == "following") {
+    return server_directory + "_" + client + "following.txt";
+  }
+  return NULL;
+}
+
 // Helper function to write message to file in the required format
 void write_message_to_file(const std::string& username, const Message& message) {
   std::string filename = server_directory + "/" + username + ".txt";
   std::ofstream file(filename, std::ios::app);
-  
+
   if (file.is_open()) {
     // Convert timestamp to string
     std::time_t time = message.timestamp().seconds();
     std::string time_str = std::ctime(&time);
     time_str.pop_back(); // Remove newline
-    
+
     // Write in the required format
     file << "T " << time_str << std::endl;
     file << "U " << message.username() << std::endl;
     file << "W " << message.msg() << std::endl;
     file << std::endl; // Empty line
-    
+
     file.close();
   }
+}
+
+// Helper function to write username to all_users.txt
+void add_user_to_all_users_file(const std::string& username) {
+  std::string filename = get_filepath("user", "INVALID");
+  std::string semName = get_sem_name("user", "INVALID");
+  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
+  // Wait for lock before reading/writing
+  sem_wait(fileSem);
+
+  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
+  // Check if user already exists in file
+  std::ifstream infile(filename);
+  std::string line;
+  while (std::getline(infile, line)) {
+    if (line == username) {
+      infile.close();
+      sem_post(fileSem);
+      sem_close(fileSem);
+      return; // User already in file
+    }
+  }
+  infile.close();
+
+  // User not in file, append it
+  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
+  std::ofstream file(filename, std::ios::app);
+  if (file.is_open()) {
+    file << username << std::endl;
+    file.close();
+  }
+
+  // Release lock
+  sem_post(fileSem);
+  sem_close(fileSem);
+}
+
+// Helper function to add follower relationship
+void add_follower_to_file(const std::string& target_username, const std::string& follower_username) {
+  std::string filename = get_filepath("followers", target_username);
+  std::string semName = get_sem_name("followers", target_username);
+
+  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
+  // Wait for lock before reading/writing
+  sem_wait(fileSem);
+
+  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
+  // Check if follower already exists in file
+  std::ifstream infile(filename);
+  std::string line;
+  while (std::getline(infile, line)) {
+    if (line == follower_username) {
+      infile.close();
+      sem_post(fileSem);
+      sem_close(fileSem);
+      return; // Follower already in file
+    }
+  }
+  infile.close();
+
+  // Follower not in file, append it
+  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
+  std::ofstream file(filename, std::ios::app);
+  if (file.is_open()) {
+    file << follower_username << std::endl;
+    file.close();
+  }
+
+  // Release lock
+  sem_post(fileSem);
+  sem_close(fileSem);
+}
+
+// Helper function to add following relationship
+void add_following_to_file(const std::string& username, const std::string& target_username) {
+  std::string filename = get_filepath("following", username);
+  std::string semName = get_sem_name("following", username); 
+  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
+  // Wait for lock before reading/writing
+  sem_wait(fileSem);
+
+  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
+  // Check if target user already exists in file
+  std::ifstream infile(filename);
+  std::string line;
+  while (std::getline(infile, line)) {
+    if (line == target_username) {
+      infile.close();
+      sem_post(fileSem);
+      sem_close(fileSem);
+      return; // Already following
+    }
+  }
+  infile.close();
+
+  // Not following yet, append it
+  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
+  std::ofstream file(filename, std::ios::app);
+  if (file.is_open()) {
+    file << target_username << std::endl;
+    file.close();
+  }
+
+  // Release lock
+  sem_post(fileSem);
+  sem_close(fileSem);
 }
 
 // Helper function to get file modification time using stat()
@@ -402,6 +561,10 @@ class SNSServiceImpl final : public SNSService::Service {
     follower_client->client_following.push_back(target_client);
     target_client->client_followers.push_back(follower_client);
 
+    // Persist follow relationship to files
+    add_following_to_file(follower_username, target_username);
+    add_follower_to_file(target_username, follower_username);
+
     // Record the follow time
     std::time_t follow_time = std::time(nullptr);
     follower_client->follow_times[target_username] = follow_time;
@@ -543,6 +706,9 @@ class SNSServiceImpl final : public SNSService::Service {
       new_client->username = username;
       new_client->connected = true;
       client_db.push_back(new_client);
+
+      // Persist new user to all_users.txt
+      add_user_to_all_users_file(username);
       log(INFO, "New user " + username + " created and connected");
     }
 
@@ -713,165 +879,6 @@ class SNSServiceImpl final : public SNSService::Service {
 
 };
 
-// Master-Slave service implementation (Slave receives mirrored requests)
-// class MasterSlaveServiceImpl final : public MasterSlaveService::Service {
-
-//   Status MirrorLogin(ServerContext* context, const Request* request, Reply* reply) override {
-//     std::string username = request->username();
-//     log(INFO, "[SLAVE] Mirrored Login request from user: " + username);
-
-//     if (username.empty()) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     for (Client* client : client_db) {
-//       if (client->username == username && client->connected) {
-//         reply->set_msg("FAILURE_ALREADY_EXISTS");
-//         return Status::OK;
-//       }
-//     }
-
-//     Client* existing_client = nullptr;
-//     for (Client* client : client_db) {
-//       if (client->username == username) {
-//         existing_client = client;
-//         break;
-//       }
-//     }
-
-//     if (existing_client != nullptr) {
-//       existing_client->connected = true;
-//       log(INFO, "[SLAVE] User " + username + " reconnected");
-//     } else {
-//       Client* new_client = new Client();
-//       new_client->username = username;
-//       new_client->connected = true;
-//       client_db.push_back(new_client);
-//       log(INFO, "[SLAVE] New user " + username + " created");
-//     }
-
-//     reply->set_msg("SUCCESS");
-//     return Status::OK;
-//   }
-
-//   Status MirrorFollow(ServerContext* context, const Request* request, Reply* reply) override {
-//     std::string follower_username = request->username();
-//     std::string target_username = request->arguments(0);
-
-//     log(INFO, "[SLAVE] Mirrored Follow request: " + follower_username + " follows " + target_username);
-
-//     if (target_username.empty()) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     if (follower_username == target_username) {
-//       reply->set_msg("FAILURE_ALREADY_EXISTS");
-//       return Status::OK;
-//     }
-
-//     Client* follower_client = nullptr;
-//     Client* target_client = nullptr;
-
-//     for (Client* client : client_db) {
-//       if (client->username == follower_username) {
-//         follower_client = client;
-//       }
-//       if (client->username == target_username) {
-//         target_client = client;
-//       }
-//     }
-
-//     if (target_client == nullptr || follower_client == nullptr) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     for (Client* following : follower_client->client_following) {
-//       if (following->username == target_username) {
-//         reply->set_msg("FAILURE_ALREADY_EXISTS");
-//         return Status::OK;
-//       }
-//     }
-
-//     follower_client->client_following.push_back(target_client);
-//     target_client->client_followers.push_back(follower_client);
-
-//     std::time_t follow_time = std::time(nullptr);
-//     follower_client->follow_times[target_username] = follow_time;
-
-//     reply->set_msg("SUCCESS");
-//     return Status::OK;
-//   }
-
-//   Status MirrorUnFollow(ServerContext* context, const Request* request, Reply* reply) override {
-//     std::string follower_username = request->username();
-//     std::string target_username = request->arguments(0);
-
-//     log(INFO, "[SLAVE] Mirrored UnFollow request: " + follower_username + " unfollows " + target_username);
-
-//     if (target_username.empty()) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     if (follower_username == target_username) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     Client* follower_client = nullptr;
-//     Client* target_client = nullptr;
-
-//     for (Client* client : client_db) {
-//       if (client->username == follower_username) {
-//         follower_client = client;
-//       }
-//       if (client->username == target_username) {
-//         target_client = client;
-//       }
-//     }
-
-//     if (target_client == nullptr || follower_client == nullptr) {
-//       reply->set_msg("FAILURE_INVALID_USERNAME");
-//       return Status::OK;
-//     }
-
-//     bool was_following = false;
-//     for (auto it = follower_client->client_following.begin(); it != follower_client->client_following.end(); ++it) {
-//       if ((*it)->username == target_username) {
-//         follower_client->client_following.erase(it);
-//         was_following = true;
-//         break;
-//       }
-//     }
-
-//     if (was_following) {
-//       for (auto it = target_client->client_followers.begin(); it != target_client->client_followers.end(); ++it) {
-//         if ((*it)->username == follower_username) {
-//           target_client->client_followers.erase(it);
-//           break;
-//         }
-//       }
-//       follower_client->follow_times.erase(target_username);
-//     }
-
-//     if (!was_following) {
-//       reply->set_msg("FAILURE_NOT_A_FOLLOWER");
-//       return Status::OK;
-//     }
-
-//     reply->set_msg("SUCCESS");
-//     return Status::OK;
-//   }
-
-//   Status MirrorTimeline(ServerContext* context, ServerReaderWriter<Message, Message>* stream) override {
-//     log(INFO, "[SLAVE] Mirrored Timeline stream started");
-//     return Status::OK;
-//   }
-// };
-
 void RunServer(std::string port_no) {
   // Server role is initially false (Slave), will be set by Coordinator on first heartbeat
   is_master = false;
@@ -939,11 +946,8 @@ int main(int argc, char** argv) {
   coordinator_port = coord_port;
   server_port = port;
 
-  // Create server directory if it doesn't exist
-  server_directory = "server_" + cluster_id + "_" + server_id;
-  mkdir(server_directory.c_str(), 0777);
-
   std::string log_file_name = std::string("server-") + cluster_id + "-" + server_id;
+  FLAGS_log_prefix = false;
   google::InitGoogleLogging(log_file_name.c_str());
   log(INFO, "Logging Initialized. Server starting...");
   log(INFO, "Configuration: Cluster=" + cluster_id + ", Server=" + server_id +

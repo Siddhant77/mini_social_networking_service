@@ -234,6 +234,12 @@ std::size_t WriteAllUsers(const ClusterFilesContext &ctx, const std::vector<std:
 bool NeedToSynch(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, int seconds = 5) {
     std::string path = GetFilePath(ctx, type, username);
 
+    if (!fs::exists(path)) {
+        return false;
+    }
+    // temp hacky fix
+    return true;
+
     auto last_write_time = fs::last_write_time(path);
     auto current_time = fs::file_time_type::clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(current_time - last_write_time);

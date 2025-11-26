@@ -21,16 +21,16 @@ GLOG_logtostderr=1 ./tsd -c 2 -s 2 -h localhost -k 9000 -p 10004 &
 GLOG_logtostderr=1 ./tsd -c 3 -s 2 -h localhost -k 9000 -p 10005 &
 
 
-sleep 1
+# sleep 1
 
-echo "STARTING SYNCHRONIZER PROCESSES"
+# echo "STARTING SYNCHRONIZER PROCESSES"
 
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9001 -i 1 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9002 -i 2 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9003 -i 3 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9001 -i 1 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9002 -i 2 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9003 -i 3 &
 
-sleep 1 
+# sleep 1 
 
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9004 -i 4 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9005 -i 5 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9006 -i 6 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9004 -i 4 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9005 -i 5 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9006 -i 6 &

@@ -58,6 +58,7 @@ synchronizer: coordinator.pb.o coordinator.grpc.pb.o sns.pb.o sns.grpc.pb.o clus
 
 clean:
 	rm -f *.txt *.o *.pb.cc *.pb.h tsc tsd coordinator synchronizer
+	rm -rf cluster_[0-9]* *.dSYM
 
 
 # The following is to test your system and ensure a smoother experience.

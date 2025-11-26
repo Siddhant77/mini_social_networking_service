@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unordered_map>
+#include <queue>
 #include <vector>
 #include <unordered_set>
 #include <fcntl.h>
@@ -40,6 +41,7 @@
 #include <amqp.h>
 #include <amqp_tcp_socket.h>
 #include <jsoncpp/json/json.h>
+#include <condition_variable>
 
 #define log(severity, msg) \
     LOG(severity) << msg;  \
@@ -119,6 +121,7 @@ cluster_files::ClusterFilesContext CurrentClusterContext() {
     if (clusterSubdirectory.empty()) {
         clusterSubdirectory = (synchID <= 3) ? "1" : "2";
     }
+
     return cluster_files::MakeContext(clusterID, clusterSubdirectory);
 }
 
@@ -145,7 +148,19 @@ class SynchronizerRabbitMQ
 {
 private:
     amqp_connection_state_t conn;
-    amqp_channel_t channel;
+    // Publish channels (one per message type)
+    amqp_channel_t publish_users_channel;
+    amqp_channel_t publish_followers_channel;
+    amqp_channel_t publish_following_channel;
+    amqp_channel_t publish_timeline_channel;
+    // Consume channels (one per message type)
+    amqp_channel_t consume_users_channel;
+    amqp_channel_t consume_followers_channel;
+    amqp_channel_t consume_following_channel;
+    amqp_channel_t consume_timeline_channel;
+    std::mutex dispatch_mutex;
+    std::condition_variable dispatch_cv;
+    std::unordered_map<amqp_channel_t, std::queue<std::string>> dispatch_queues;
     std::string hostname;
     int port;
     int synchID;
@@ -158,78 +173,166 @@ private:
         amqp_socket_t *socket = amqp_tcp_socket_new(conn);
         amqp_socket_open(socket, hostname.c_str(), port);
         amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
-        amqp_channel_open(conn, channel);
+        // Open 4 publish channels (one per message type)
+        amqp_channel_open(conn, publish_users_channel);
+        amqp_channel_open(conn, publish_followers_channel);
+        amqp_channel_open(conn, publish_following_channel);
+        amqp_channel_open(conn, publish_timeline_channel);
+        // Open 4 consume channels (one per message type)
+        amqp_channel_open(conn, consume_users_channel);
+        amqp_channel_open(conn, consume_followers_channel);
+        amqp_channel_open(conn, consume_following_channel);
+        amqp_channel_open(conn, consume_timeline_channel);
     }
 
-    void declareQueue(const std::string &queueName)
+    void declareQueue(const std::string &queueName, const std::string &messageType = "users")
     {
         log(INFO, "declareQueue RabbitMQ queue: " + std::string(queueName));
+        // Determine which consume channel based on queue name
+        amqp_channel_t channel = consume_users_channel;
+        if (messageType == "follower") {
+            channel = consume_followers_channel;
+        } else if (messageType == "following") {
+            channel = consume_following_channel;
+        } else if (messageType == "timeline") {
+            channel = consume_timeline_channel;
+        }
         amqp_queue_declare(conn, channel, amqp_cstring_bytes(queueName.c_str()),
                            0, 0, 0, 0, amqp_empty_table);
     }
 
-    void publishMessage(const std::string &queueName, const std::string &message)
+    void publishMessage(const std::string &queueName, const std::string &message, const std::string &messageType)
     {
-        // log(INFO, "publishMessage " + std::string(message) + " to RabbitMQ queue: " + std::string(queueName));
+        // Determine which publish channel based on message type
+        amqp_channel_t channel = publish_users_channel;
+        if (messageType == "follower") {
+            channel = publish_followers_channel;
+        } else if (messageType == "following") {
+            channel = publish_following_channel;
+        } else if (messageType == "timeline") {
+            channel = publish_timeline_channel;
+        }
+        log(INFO, "publishMessage " + std::string(message) + " to RabbitMQ queue: " + std::string(queueName) + " on channel " + std::to_string(channel) + " (" + channelName(channel) + ")");
         amqp_basic_publish(conn, channel, amqp_empty_bytes, amqp_cstring_bytes(queueName.c_str()),
                            0, 0, NULL, amqp_cstring_bytes(message.c_str()));
     }
 
-    std::string consumeMessage(const std::string &queueName, int timeout_ms = 5000)
+    std::string channelName(amqp_channel_t channel) const
     {
-        // log(INFO, "consumeMessage from RabbitMQ queue: " + queueName);
-        amqp_basic_consume(conn, channel, amqp_cstring_bytes(queueName.c_str()),
-                           amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        if (channel == consume_users_channel) return "consume_users";
+        if (channel == consume_followers_channel) return "consume_followers";
+        if (channel == consume_following_channel) return "consume_following";
+        if (channel == consume_timeline_channel) return "consume_timeline";
+        if (channel == publish_users_channel) return "publish_users";
+        if (channel == publish_followers_channel) return "publish_followers";
+        if (channel == publish_following_channel) return "publish_following";
+        if (channel == publish_timeline_channel) return "publish_timeline";
+        return "unknown";
+    }
 
-        amqp_envelope_t envelope;
-        amqp_maybe_release_buffers(conn);
+    std::string consumeMessage(amqp_channel_t channel)
+    {
+        std::unique_lock<std::mutex> lock(dispatch_mutex);
+        dispatch_cv.wait(lock, [&]() {
+            auto it = dispatch_queues.find(channel);
+            return it != dispatch_queues.end() && !it->second.empty();
+        });
 
-        struct timeval timeout;
-        timeout.tv_sec = timeout_ms / 1000;
-        timeout.tv_usec = (timeout_ms % 1000) * 1000;
-
-        amqp_rpc_reply_t res = amqp_consume_message(conn, &envelope, &timeout, 0);
-
-        if (res.reply_type != AMQP_RESPONSE_NORMAL)
-        {
-            return "";
-        }
-
-        std::string message(static_cast<char *>(envelope.message.body.bytes), envelope.message.body.len);
-        amqp_destroy_envelope(&envelope);
+        std::string message = dispatch_queues[channel].front();
+        dispatch_queues[channel].pop();
         return message;
     }
 
 public:
     // SynchronizerRabbitMQ(const std::string &host, int p, int id) : hostname(host), port(p), channel(1), synchID(id)
     SynchronizerRabbitMQ(
-        const std::string &host, 
-        int p, 
-        int id, 
+        const std::string &host,
+        int p,
+        int id,
         const std::string &coordAddr)
-        : hostname("rabbitmq"), 
-        port(p), 
-        channel(1), 
+        : hostname("rabbitmq"),
+        port(p),
+        publish_users_channel(1),
+        publish_followers_channel(2),
+        publish_following_channel(3),
+        publish_timeline_channel(4),
+        consume_users_channel(5),
+        consume_followers_channel(6),
+        consume_following_channel(7),
+        consume_timeline_channel(8),
         synchID(id),
         coord_stub(std::unique_ptr<CoordService::Stub>(
             CoordService::NewStub(
                 grpc::CreateChannel(coordAddr, grpc::InsecureChannelCredentials()))))
     {
         setupRabbitMQ();
-        user_queue = get_user_queue(synchID); //"s_" + std::to_string(synchID) + "_users_Q";
-        client_follower_queue = get_follower_queue(synchID); // "s_" + std::to_string(synchID) + "_follower_Q";
-        client_following_queue = get_following_queue(synchID); // "s_" + std::to_string(synchID) + "_following_Q";
-        timeline_queue = get_timeline_queue(synchID); // "s_" + std::to_string(synchID) + "_tl_Q";
-        declareQueue(user_queue);
-        declareQueue(client_follower_queue);
-        declareQueue(client_following_queue);
-        declareQueue(timeline_queue);
+        user_queue = get_user_queue(synchID);
+        client_follower_queue = get_follower_queue(synchID);
+        client_following_queue = get_following_queue(synchID);
+        timeline_queue = get_timeline_queue(synchID);
+        declareQueue(user_queue, "users");
+        declareQueue(client_follower_queue, "follower");
+        declareQueue(client_following_queue, "following");
+        declareQueue(timeline_queue, "timeline");
+
+        // Initialize consumers - register each queue on its dedicated consume channel
+        amqp_basic_consume(conn, consume_users_channel, amqp_cstring_bytes(user_queue.c_str()),
+                           amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        amqp_basic_consume(conn, consume_followers_channel, amqp_cstring_bytes(client_follower_queue.c_str()),
+                           amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        amqp_basic_consume(conn, consume_following_channel, amqp_cstring_bytes(client_following_queue.c_str()),
+                           amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        amqp_basic_consume(conn, consume_timeline_channel, amqp_cstring_bytes(timeline_queue.c_str()),
+                           amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        log(INFO, "S_" + std::to_string(synchID) + " initialized all consumers");
     }
 
+    void dispatcherLoop()
+    {
+        while (true)
+        {
+            amqp_envelope_t envelope;
+            amqp_maybe_release_buffers(conn);
+            amqp_rpc_reply_t res = amqp_consume_message(conn, &envelope, nullptr, 0);
+
+            if (res.reply_type != AMQP_RESPONSE_NORMAL)
+            {
+                amqp_destroy_envelope(&envelope);
+                continue;
+            }
+
+            std::string payload(static_cast<char *>(envelope.message.body.bytes), envelope.message.body.len);
+            amqp_channel_t delivery_channel = envelope.channel;
+            amqp_destroy_envelope(&envelope);
+
+            {
+                std::lock_guard<std::mutex> lock(dispatch_mutex);
+                dispatch_queues[delivery_channel].push(payload);
+            }
+            dispatch_cv.notify_all();
+        }
+    }
 
     void publishUserList()
     {
+        // log(INFO, "S_" + std::to_string(synchID) + " publishUserList called");
         std::vector<std::string> users = get_all_users_func(synchID);
+
+        // Early return if no users
+        if (users.empty()) {
+            return;
+        }
+
+        // Early return if all_users file hasn't changed recently
+        // if (!NeedToSynch(
+        //         CurrentClusterContext(),
+        //         cluster_files::UserFileType::kAllUsers,
+        //         "INVALID",
+        //         5)) {
+        //     log(INFO, "S_" + std::to_string(synchID) + " publishUserList: No recent changes to all_users file, skipping publish.");
+        //     return;
+        // }
+
         std::sort(users.begin(), users.end());
         Json::Value userList;
         for (const auto &user : users)
@@ -238,13 +341,12 @@ public:
         }
         Json::FastWriter writer;
         std::string message = writer.write(userList);
-        
 
-        if (message.empty()){
+        if (message.empty() || message == "null"){
             return;
         }
 
-        log(INFO, "S_" + std::to_string(synchID) + " publish " + std::to_string(users.size()) + " users : " + message);
+
 
         ServerList allSynchronizers = getAllSynchronizers();
 
@@ -252,48 +354,81 @@ public:
         for (int i = 0; i < allSynchronizers.serverid_size(); i++) {
             int serverId = allSynchronizers.serverid(i);
             if (serverId != synchID) {
-                // log(INFO, "S_" + std::to_string(synchID) + " publish " + std::to_string(users.size()) + " users : " + message + " to " + get_user_queue(serverId));
-                publishMessage(get_user_queue(serverId), message);
+                log(INFO, "S_" + std::to_string(synchID) + " publish " + message + " to " + get_user_queue(serverId));
+                publishMessage(get_user_queue(serverId), message, "users");
             }
         }
     }
 
-    void consumeUserLists()
+    void handleUserListMessage(const std::string &message)
     {
-        std::vector<std::string> allUsers;
-        std::unordered_set<std::string> uniqueUsers; // Track unique users to avoid duplicates
-
-        // Consume user list from our own queue (other synchronizers publish to our queue)
-        std::string message = consumeMessage(user_queue, 1000); // 1 second timeout
-        if (!message.empty())
+        if (message.empty() || message == "null")
         {
-            Json::Value root;
-            Json::Reader reader;
-            if (reader.parse(message, root))
+            return;
+        }
+
+        // Parse incoming data
+        Json::Value root;
+        Json::Reader reader;
+        if (!reader.parse(message, root))
+        {
+            return;
+        }
+
+        // Extract incoming users
+        std::vector<std::string> incomingUsers;
+        for (const auto &user : root["users"])
+        {
+            incomingUsers.push_back(user.asString());
+        }
+
+        // Get current data
+        std::vector<std::string> currentUsers = get_all_users_func(synchID);
+
+        // Find new users that aren't in current list
+        std::vector<std::string> newUsers;
+        for (const auto &incomingUser : incomingUsers)
+        {
+            if (std::find(currentUsers.begin(), currentUsers.end(), incomingUser) == currentUsers.end())
             {
-                for (const auto &user : root["users"])
-                {
-                    std::string userName = user.asString();
-                    // Only add unique users
-                    if (uniqueUsers.find(userName) == uniqueUsers.end())
-                    {
-                        allUsers.push_back(userName);
-                        uniqueUsers.insert(userName);
-                    }
-                }
+                newUsers.push_back(incomingUser);
             }
         }
-        if (!allUsers.empty()) {
 
-            updateAllUsersFile(allUsers);
+        // Only update if there are new users to add
+        if (!newUsers.empty())
+        {
+            // Merge: combine current users with new users
+            std::vector<std::string> mergedUsers = currentUsers;
+            mergedUsers.insert(mergedUsers.end(), newUsers.begin(), newUsers.end());
+            updateAllUsersFile(mergedUsers);
+            log(INFO, "S_" + std::to_string(synchID) + " consumeUserLists : added " +
+                      std::to_string(newUsers.size()) + " new users from queue: " + user_queue);
         }
-        if (!uniqueUsers.empty()){
-            log(INFO, "S_" + std::to_string(synchID) + " consumeUserLists : " + std::string(message) + " from queue: " + user_queue);
+        // If incoming is subset of or equal to current, do nothing - break the cycle
+    }
+
+    void consumeUserListsLoop()
+    {
+        while (true)
+        {
+            std::string message = consumeMessage(consume_users_channel);
+            handleUserListMessage(message);
         }
     }
 
     void publishClientFollower()
     {
+        // log(INFO, "S_" + std::to_string(synchID) + " publishClientFollower called");
+        // Early return if followers file hasn't changed recently
+        // if (!NeedToSynch(
+        //         CurrentClusterContext(),
+        //         cluster_files::UserFileType::kFollowers,
+        //         std::to_string(synchID),
+        //         5)) {
+        //     return;
+        // }
+
         Json::Value relations;
         std::vector<std::string> users = get_all_users_func(synchID);
 
@@ -330,18 +465,14 @@ public:
         for (int i = 0; i < allSynchronizers.serverid_size(); i++) {
             int serverId = allSynchronizers.serverid(i);
             if (serverId != synchID) {
-                publishMessage(get_follower_queue(serverId), message);
+                publishMessage(get_follower_queue(serverId), message, "follower");
             }
         }
     }
 
-    void consumeClientFollower()
+    void handleFollowerMessage(const std::string &message)
     {
         std::vector<std::string> allUsers = get_all_users_func(synchID);
-        int relationsConsumed = 0;
-
-        std::string message = consumeMessage(client_follower_queue, 1000); // 1 second timeout
-        log(INFO, "S_ " + std::to_string(synchID) + " consuming client follower with " + message);
 
         if (!message.empty())
         {
@@ -349,7 +480,6 @@ public:
             Json::Reader reader;
             if (reader.parse(message, root))
             {
-                relationsConsumed += root.size();
                 for (const auto &client : allUsers)
                 {
                     if (root.isMember(client))
@@ -369,8 +499,28 @@ public:
         }
     }
 
+    void consumeClientFollowerLoop()
+    {
+        while (true)
+        {
+            std::string message = consumeMessage(consume_followers_channel);
+            log(INFO, "S_" + std::to_string(synchID) + " consuming client follower with " + message);
+            handleFollowerMessage(message);
+        }
+    }
+
     void publishClientFollowing()
     {
+        // log(INFO, "S_" + std::to_string(synchID) + " publishClientFollowing called");
+        // Early return if following file hasn't changed recently
+        // if (!NeedToSynch(
+        //         CurrentClusterContext(),
+        //         cluster_files::UserFileType::kFollowing,
+        //         std::to_string(synchID),
+        //         5)) {
+        //     return;
+        // }
+
         Json::Value following;
         std::vector<std::string> users = get_all_users_func(synchID);
 
@@ -396,7 +546,7 @@ public:
 
         Json::FastWriter writer;
         std::string message = writer.write(following);
-        
+
         if (message.empty()){
             return;
         }
@@ -408,28 +558,22 @@ public:
         for (int i = 0; i < allSynchronizers.serverid_size(); i++) {
             int serverId = allSynchronizers.serverid(i);
             if (serverId != synchID) {
-                publishMessage(get_following_queue(serverId), message);
+                publishMessage(get_following_queue(serverId), message, "following");
 
             }
         }
 
     }
 
-    void consumeClientFollowing()
+    void handleFollowingMessage(const std::string &message)
     {
         std::vector<std::string> allUsers = get_all_users_func(synchID);
-        int followingConsumed = 0;
-
-
-        std::string message = consumeMessage(client_following_queue, 1000); // 1 second timeout
-        log(INFO, "S_" + std::to_string(synchID) + " consuming client following : " + message);
         if (!message.empty())
         {
             Json::Value root;
             Json::Reader reader;
             if (reader.parse(message, root))
             {
-                followingConsumed += root.size();
                 for (const auto &client : allUsers)
                 {
                     if (root.isMember(client))
@@ -446,6 +590,16 @@ public:
                     }
                 }
             }
+        }
+    }
+
+    void consumeClientFollowingLoop()
+    {
+        while (true)
+        {
+            std::string message = consumeMessage(consume_following_channel);
+            log(INFO, "S_" + std::to_string(synchID) + " consuming client following : " + message);
+            handleFollowingMessage(message);
         }
     }
 
@@ -558,7 +712,7 @@ public:
 
                 // Publish to the follower's synchronizer's timeline queue
                 std::string queueName = "s_" + std::to_string(target_synch) + "_tl_Q";
-                publishMessage(queueName, message);
+                publishMessage(queueName, message, "timeline");
                 timelinesPublished++;
                 // log(INFO, "S_ " + std::to_string(synchID) + " published timeline for user " + client +
                 //            " to synch " + std::to_string(target_synch) + " (follower " + follower + ")");
@@ -572,8 +726,8 @@ public:
     // For each client in your cluster, consume messages from your timeline queue and modify your client's timeline files based on what the users they follow posted to their timeline
     void consumeTimelines()
     {
-        std::string timeline_queue = "s_" + std::to_string(synchID) + "_tl_Q";
-        std::string message = consumeMessage(timeline_queue, 1000); // 1 second timeout
+        std::string timeline_queue = get_timeline_queue(synchID);
+        std::string message = consumeMessage(consume_timeline_channel);
 
         // log(INFO, "consumeTimelines Synchronizer " + std::to_string(synchID) + " queue: " + timeline_queue + " message size: " + std::to_string(message.size()));
 
@@ -630,6 +784,14 @@ public:
                 //                ", updated " + std::to_string(timelineUpdates) + " clients");
                 // }
             }
+        }
+    }
+
+    void consumeTimelinesLoop()
+    {
+        while (true)
+        {
+            consumeTimelines();
         }
     }
 
@@ -694,20 +856,32 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
 
     std::thread t1(run_synchronizer, coordIP, coordPort, port_no, synchID, std::ref(rabbitMQ));
 
-    // Create a consumer thread
-    std::thread consumerThread([&rabbitMQ]()
-    {
-        while (true) {
-            // log(INFO, "consumer thread ...");
-            rabbitMQ.consumeUserLists();
-            rabbitMQ.consumeClientFollower();
-            rabbitMQ.consumeClientFollowing();
-            // rabbitMQ.consumeTimelines();
-            
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            // you can modify this sleep period as per your choice
-        } 
+    // Create dispatcher and consumer threads
+    std::thread dispatcher([&rabbitMQ]() {
+        rabbitMQ.dispatcherLoop();
     });
+
+    std::thread userConsumer([&rabbitMQ]() {
+        rabbitMQ.consumeUserListsLoop();
+    });
+
+    std::thread followerConsumer([&rabbitMQ]() {
+        rabbitMQ.consumeClientFollowerLoop();
+    });
+
+    std::thread followingConsumer([&rabbitMQ]() {
+        rabbitMQ.consumeClientFollowingLoop();
+    });
+
+    // std::thread timelineConsumer([&rabbitMQ]() {
+    //     rabbitMQ.consumeTimelinesLoop();
+    // });
+
+    dispatcher.detach();
+    userConsumer.detach();
+    followerConsumer.detach();
+    followingConsumer.detach();
+    // timelineConsumer.detach();
 
     server->Wait();
 
@@ -798,12 +972,14 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         }
     }
 
+    log(INFO, "run_synchronizer Synchronizer " + std::to_string(synchID) + " starting main loop");
+
     while (true)
     {
         // log(INFO, "run_synchronizer Synchronizer runner thread started for synch " + std::to_string(synchID));
 
         // the synchronizers sync files every 5 seconds
-        sleep(3);
+        sleep(7);
 
         // Only publish if this is a Master synchronizer
         if (isMaster) {

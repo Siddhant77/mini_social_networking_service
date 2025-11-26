@@ -213,10 +213,12 @@ bool remove_follow_entry(cluster_files::UserFileType type,
   return false;
 }
 
-std::vector<Message> collect_timeline_messages(const std::vector<FollowRecord>& following) {
+std::vector<Message> collect_timeline_messages(const std::vector<FollowRecord>& following, std::time_t last_sent_time = 0) {
   std::vector<Message> timeline_messages;
   for (const auto& record : following) {
-    std::vector<Message> user_messages = read_last_messages(record.username, 20, record.timestamp);
+    // Use the maximum of follow time and last sent time to avoid duplicates
+    std::time_t cutoff_time = std::max(record.timestamp, last_sent_time);
+    std::vector<Message> user_messages = read_last_messages(record.username, 20, cutoff_time);
     timeline_messages.insert(timeline_messages.end(), user_messages.begin(), user_messages.end());
   }
   std::sort(timeline_messages.begin(), timeline_messages.end(),
@@ -441,9 +443,6 @@ bool mirrorToSlave(const Request& request, Reply* reply, const std::string& meth
   else if (method == "UnFollow") {
     return global_slave_stub->UnFollow(&context, request, reply).ok();
   }
-  // else if (method == "List") {
-  //   return global_slave_stub->List(&context, request, reply).ok();
-  // }
   return true;
 }
 
@@ -665,66 +664,6 @@ class SNSServiceImpl final : public SNSService::Service {
     }
     log(INFO, "Sent " + std::to_string(count) + " timeline messages to user: " + username);
 
-    std::atomic<bool> timeline_active(true);
-
-    std::thread monitor_thread([&, username]() {
-      std::map<std::string, std::time_t> last_mtime;
-
-      auto sync_last_mtime = [&](const std::vector<FollowRecord>& records) {
-        std::unordered_set<std::string> seen;
-        for (const auto& rec : records) {
-          seen.insert(rec.username);
-          if (last_mtime.find(rec.username) == last_mtime.end()) {
-            std::string filename = server_directory + "/" + rec.username + ".txt";
-            last_mtime[rec.username] = get_file_mtime(filename);
-          }
-        }
-        for (auto it = last_mtime.begin(); it != last_mtime.end();) {
-          if (seen.find(it->first) == seen.end()) {
-            it = last_mtime.erase(it);
-          } else {
-            ++it;
-          }
-        }
-      };
-
-      auto initial_following = get_following_records(username);
-      sync_last_mtime(initial_following);
-
-      while (timeline_active.load()) {
-        sleep(5);
-        if (!timeline_active.load()) {
-          break;
-        }
-
-        auto current_following = get_following_records(username);
-        sync_last_mtime(current_following);
-        std::time_t current_time = std::time(nullptr);
-
-        for (const auto& record : current_following) {
-          std::string filename = server_directory + "/" + record.username + ".txt";
-          std::time_t current_mtime = get_file_mtime(filename);
-
-          if (current_mtime > last_mtime[record.username] &&
-              difftime(current_time, current_mtime) <= 30) {
-            log(INFO, "Timeline file for " + record.username + " modified recently, re-sending posts to " + username);
-
-            std::vector<Message> updated_timeline = collect_timeline_messages(current_following);
-            int msg_count = 0;
-            for (const Message& msg : updated_timeline) {
-              if (msg_count >= 20) break;
-              stream->Write(msg);
-              msg_count++;
-            }
-
-            log(INFO, "Re-sent " + std::to_string(msg_count) + " updated timeline messages to " + username);
-          }
-
-          last_mtime[record.username] = current_mtime;
-        }
-      }
-    });
-
     while (stream->Read(&message)) {
       if (message.username() == username) {
         log(INFO, "New message from " + username + ": " + message.msg());
@@ -733,14 +672,9 @@ class SNSServiceImpl final : public SNSService::Service {
       }
     }
 
-    timeline_active = false;
     {
       std::lock_guard<std::mutex> lock(stream_mutex);
       active_streams.erase(username);
-    }
-
-    if (monitor_thread.joinable()) {
-      monitor_thread.join();
     }
 
     log(INFO, "User " + username + " disconnected from timeline");

@@ -45,6 +45,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <atomic>
 #include <thread>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -55,6 +59,7 @@
 
 #include "sns.grpc.pb.h"
 #include "coordinator.grpc.pb.h"
+#include "cluster_files.h"
 
 
 using google::protobuf::Timestamp;
@@ -91,79 +96,159 @@ std::string slave_port;
 std::unique_ptr<SNSService::Stub> global_slave_stub;
 std::unique_ptr<CoordService::Stub> global_coord_stub;
 
-struct Client {
+struct FollowRecord {
   std::string username;
-  bool connected = true;
-  int following_file_size = 0;
-  std::vector<Client*> client_followers;
-  std::vector<Client*> client_following;
-  std::map<std::string, std::time_t> follow_times; // Track when we started following each user
-  ServerReaderWriter<Message, Message>* stream = 0;
-  bool operator==(const Client& c1) const{
-    return (username == c1.username);
-  }
+  std::time_t timestamp = 0;
+  std::string raw_line;
 };
 
-//Vector that stores every client that has been created
-std::vector<Client*> client_db;
+std::mutex active_users_mutex;
+std::unordered_set<std::string> active_users;
+std::mutex stream_mutex;
+std::unordered_map<std::string, ServerReaderWriter<Message, Message>*> active_streams;
 
-// Helper function to find client by username
-Client* find_user(const std::string& username) {
-  for (Client* client : client_db) {
-    if (client->username == username) {
-      return client;
+std::vector<Message> read_last_messages(const std::string& username, int count, std::time_t after_time);
+
+cluster_files::ClusterFilesContext CurrentClusterContext() {
+  int cluster_numeric = 1;
+  if (!cluster_id_str.empty()) {
+    cluster_numeric = std::stoi(cluster_id_str);
+  }
+  if (clusterSubdirectory.empty()) {
+    clusterSubdirectory = is_master ? "1" : "2";
+  }
+  return cluster_files::MakeContext(cluster_numeric, clusterSubdirectory);
+}
+
+void RefreshServerDirectory() {
+  if (cluster_id_str.empty()) {
+    cluster_id_str = "1";
+  }
+  clusterSubdirectory = is_master ? "1" : "2";
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  server_directory = cluster_files::GetBaseDirectory(ctx);
+}
+
+void EnsureServerDirectory() {
+  if (server_directory.empty()) {
+    RefreshServerDirectory();
+  }
+}
+
+bool user_exists(const std::string& username) {
+  if (username.empty()) return false;
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  return cluster_files::FileContainsEntry(ctx, cluster_files::UserFileType::kAllUsers, "INVALID", username);
+}
+
+std::vector<std::string> load_all_users_from_file() {
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  return cluster_files::ReadUserFile(ctx, cluster_files::UserFileType::kAllUsers, "INVALID");
+}
+
+FollowRecord parse_follow_record(const std::string& line) {
+  FollowRecord rec;
+  rec.raw_line = line;
+  size_t delim = line.find('|');
+  if (delim == std::string::npos) {
+    rec.username = line;
+    rec.timestamp = 0;
+  } else {
+    rec.username = line.substr(0, delim);
+    std::string ts = line.substr(delim + 1);
+    try {
+      rec.timestamp = ts.empty() ? 0 : static_cast<std::time_t>(std::stoll(ts));
+    } catch (...) {
+      rec.timestamp = 0;
     }
   }
-  return nullptr;
+  return rec;
+}
+
+std::vector<FollowRecord> get_follow_records(cluster_files::UserFileType type, const std::string& owner) {
+  std::vector<FollowRecord> records;
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  std::vector<std::string> lines = cluster_files::ReadUserFile(ctx, type, owner);
+  for (const auto& line : lines) {
+    if (!line.empty()) {
+      records.push_back(parse_follow_record(line));
+    }
+  }
+  return records;
+}
+
+std::vector<FollowRecord> get_following_records(const std::string& username) {
+  return get_follow_records(cluster_files::UserFileType::kFollowing, username);
+}
+
+std::vector<FollowRecord> get_follower_records(const std::string& username) {
+  return get_follow_records(cluster_files::UserFileType::kFollowers, username);
+}
+
+bool append_follow_entry(cluster_files::UserFileType type,
+                         const std::string& owner,
+                         const std::string& other_user,
+                         std::time_t timestamp) {
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  std::vector<FollowRecord> existing = get_follow_records(type, owner);
+  for (const auto& rec : existing) {
+    if (rec.username == other_user) {
+      return false;
+    }
+  }
+  std::string value = other_user + "|" + std::to_string(static_cast<long long>(timestamp));
+  return cluster_files::AppendUniqueEntry(ctx, type, owner, value);
+}
+
+bool remove_follow_entry(cluster_files::UserFileType type,
+                         const std::string& owner,
+                         const std::string& other_user) {
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  std::vector<FollowRecord> existing = get_follow_records(type, owner);
+  for (const auto& rec : existing) {
+    if (rec.username == other_user) {
+      return cluster_files::RemoveEntry(ctx, type, owner, rec.raw_line);
+    }
+  }
+  return false;
+}
+
+std::vector<Message> collect_timeline_messages(const std::vector<FollowRecord>& following) {
+  std::vector<Message> timeline_messages;
+  for (const auto& record : following) {
+    std::vector<Message> user_messages = read_last_messages(record.username, 20, record.timestamp);
+    timeline_messages.insert(timeline_messages.end(), user_messages.begin(), user_messages.end());
+  }
+  std::sort(timeline_messages.begin(), timeline_messages.end(),
+            [](const Message& a, const Message& b) {
+              return a.timestamp().seconds() > b.timestamp().seconds();
+            });
+  return timeline_messages;
+}
+
+void broadcast_to_followers(const std::string& username, const Message& message) {
+  std::vector<FollowRecord> followers = get_follower_records(username);
+  for (const auto& follower : followers) {
+    ServerReaderWriter<Message, Message>* follower_stream = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(stream_mutex);
+      auto it = active_streams.find(follower.username);
+      if (it != active_streams.end()) {
+        follower_stream = it->second;
+      }
+    }
+    if (follower_stream != nullptr) {
+      follower_stream->Write(message);
+      log(INFO, "Broadcasted message from " + username + " to follower: " + follower.username);
+    }
+  }
 }
 
 
-
-std::string get_sem_name(std::string file_type, std::string client) {
-  if (file_type == "users") {
-    return "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + "users";
-  } 
-  else if (file_type == "followers") {
-    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_followers";
-  } 
-  else if (file_type == "timeline") {
-    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_timeline";
-  }
-  else if (file_type == "following") {
-    return  "/" + cluster_id_str + "_" + clusterSubdirectory + "_" + client + "_following";
-  }
-  return ".invalid/sem/name.fuk";
-}
-
-std::string get_filepath(std::string file_type, std::string client) {
-
-  // Create server directory if it doesn't exist
-  // Use same directory structure as synchronizer: ./cluster_{clusterID}/{clusterSubdirectory}/
-  // clusterSubdirectory is "1" (Master) or "2" (Slave) based on is_master flag
-
-  std::string cluster_dir = "./cluster_" + cluster_id_str;
-  mkdir(cluster_dir.c_str(), 0777);
-
-  std::string server_directory = "./cluster_" + cluster_id_str + "/" + clusterSubdirectory + "/";
-  mkdir(server_directory.c_str(), 0777);
-
-  if (file_type == "users") {
-    return server_directory + "all_users.txt";
-  }
-  else if (file_type == "followers") {
-    return  server_directory + "_" + client + "_followers.txt";
-  }
-  else if (file_type == "timeline") {
-    return  server_directory + "_" + client + "_timeline.txt";
-  } 
-  else if (file_type == "following") {
-    return server_directory + "_" + client + "following.txt";
-  }
-  return NULL;
-}
 
 // Helper function to write message to file in the required format
 void write_message_to_file(const std::string& username, const Message& message) {
+  EnsureServerDirectory();
   std::string filename = server_directory + "/" + username + ".txt";
   std::ofstream file(filename, std::ios::app);
 
@@ -183,116 +268,34 @@ void write_message_to_file(const std::string& username, const Message& message) 
   }
 }
 
-// Helper function to write username to all_users.txt
 void add_user_to_all_users_file(const std::string& username) {
-  std::string filename = get_filepath("user", "INVALID");
-  std::string semName = get_sem_name("user", "INVALID");
-  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
-
-  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
-  // Wait for lock before reading/writing
-  sem_wait(fileSem);
-
-  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
-  // Check if user already exists in file
-  std::ifstream infile(filename);
-  std::string line;
-  while (std::getline(infile, line)) {
-    if (line == username) {
-      infile.close();
-      sem_post(fileSem);
-      sem_close(fileSem);
-      return; // User already in file
-    }
+  if (username.empty()) {
+    return;
   }
-  infile.close();
-
-  // User not in file, append it
-  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
-  std::ofstream file(filename, std::ios::app);
-  if (file.is_open()) {
-    file << username << std::endl;
-    file.close();
-  }
-
-  // Release lock
-  sem_post(fileSem);
-  sem_close(fileSem);
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  cluster_files::AppendUniqueEntry(ctx, cluster_files::UserFileType::kAllUsers, "", username);
 }
 
-// Helper function to add follower relationship
-void add_follower_to_file(const std::string& target_username, const std::string& follower_username) {
-  std::string filename = get_filepath("followers", target_username);
-  std::string semName = get_sem_name("followers", target_username);
-
-  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
-
-  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
-  // Wait for lock before reading/writing
-  sem_wait(fileSem);
-
-  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
-  // Check if follower already exists in file
-  std::ifstream infile(filename);
-  std::string line;
-  while (std::getline(infile, line)) {
-    if (line == follower_username) {
-      infile.close();
-      sem_post(fileSem);
-      sem_close(fileSem);
-      return; // Follower already in file
-    }
+bool add_follower_to_file(const std::string& target_username, const std::string& follower_username, std::time_t timestamp) {
+  if (target_username.empty() || follower_username.empty()) {
+    return false;
   }
-  infile.close();
-
-  // Follower not in file, append it
-  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
-  std::ofstream file(filename, std::ios::app);
-  if (file.is_open()) {
-    file << follower_username << std::endl;
-    file.close();
-  }
-
-  // Release lock
-  sem_post(fileSem);
-  sem_close(fileSem);
+  return append_follow_entry(cluster_files::UserFileType::kFollowers, target_username, follower_username, timestamp);
 }
 
-// Helper function to add following relationship
-void add_following_to_file(const std::string& username, const std::string& target_username) {
-  std::string filename = get_filepath("following", username);
-  std::string semName = get_sem_name("following", username); 
-  sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
-
-  log(INFO, "TSD acquiring lock (semaphore: " + semName + ")");
-  // Wait for lock before reading/writing
-  sem_wait(fileSem);
-
-  log(INFO, "TSD reading from file: " + filename + " (semaphore: " + semName + ")");
-  // Check if target user already exists in file
-  std::ifstream infile(filename);
-  std::string line;
-  while (std::getline(infile, line)) {
-    if (line == target_username) {
-      infile.close();
-      sem_post(fileSem);
-      sem_close(fileSem);
-      return; // Already following
-    }
+bool add_following_to_file(const std::string& username, const std::string& target_username, std::time_t timestamp) {
+  if (username.empty() || target_username.empty()) {
+    return false;
   }
-  infile.close();
+  return append_follow_entry(cluster_files::UserFileType::kFollowing, username, target_username, timestamp);
+}
 
-  // Not following yet, append it
-  log(INFO, "TSD writing to file: " + filename + " (semaphore: " + semName + ")");
-  std::ofstream file(filename, std::ios::app);
-  if (file.is_open()) {
-    file << target_username << std::endl;
-    file.close();
-  }
+bool remove_follower_from_file(const std::string& target_username, const std::string& follower_username) {
+  return remove_follow_entry(cluster_files::UserFileType::kFollowers, target_username, follower_username);
+}
 
-  // Release lock
-  sem_post(fileSem);
-  sem_close(fileSem);
+bool remove_following_from_file(const std::string& username, const std::string& target_username) {
+  return remove_follow_entry(cluster_files::UserFileType::kFollowing, username, target_username);
 }
 
 // Helper function to get file modification time using stat()
@@ -305,8 +308,13 @@ std::time_t get_file_mtime(const std::string& filename) {
 }
 
 // Helper function to read last N messages from file after a specific time
-std::vector<Message> read_last_messages(const std::string& username, int count, std::time_t after_time = 0) {
+std::vector<Message> read_last_messages(
+  const std::string& username, 
+  int count, 
+  std::time_t after_time = 0) 
+  {
   std::vector<Message> messages;
+  EnsureServerDirectory();
   std::string filename = server_directory + "/" + username + ".txt";
   std::ifstream file(filename);
 
@@ -380,6 +388,7 @@ bool sendHeartbeat(std::unique_ptr<CoordService::Stub>& coord_stub) {
 
   if (status.ok() && confirmation.status()) {
     is_master = confirmation.is_master();
+    RefreshServerDirectory();
     log(INFO, "Heartbeat sent successfully to coordinator, role: " +
               std::string(is_master ? "MASTER" : "SLAVE"));
     return true;
@@ -391,9 +400,9 @@ bool sendHeartbeat(std::unique_ptr<CoordService::Stub>& coord_stub) {
 
 // Mirror request to Slave (only if Master)
 bool mirrorToSlave(const Request& request, Reply* reply, const std::string& method) {
-    log(INFO, "I AM " + std::string(is_master ? "MASTER" : "SLAVE") + " calling mirrorToSlave ");
 
   if (!is_master) return true;
+  log(INFO, "I AM " + std::string(is_master ? "MASTER" : "SLAVE") + " calling mirrorToSlave ");
 
   // If global_slave_stub not yet initialized, query coordinator for Slave info
   if (!global_slave_stub && global_coord_stub) {
@@ -468,35 +477,26 @@ class SNSServiceImpl final : public SNSService::Service {
   Status List(ServerContext* context, const Request* request, ListReply* list_reply) override {
     std::string username = request->username();
     log(INFO, std::string(is_master ? "MASTER" : "SLAVE") + " List request from user: " + username);
-    
-    // Find the requesting user
-    Client* requesting_user = nullptr;
-    for (Client* client : client_db) {
-      if (client->username == username) {
-        requesting_user = client;
-        break;
-      }
-    }
-    
-    if (requesting_user == nullptr) {
+
+    if (!user_exists(username)) {
       log(WARNING, "List request from non-existent user: " + username);
       return Status::OK;
     }
-    
-    // Add all users to the reply
-    for (Client* client : client_db) {
-      list_reply->add_all_users(client->username);
+
+    std::vector<std::string> all_users = load_all_users_from_file();
+    for (const auto& user : all_users) {
+      list_reply->add_all_users(user);
     }
-    
-    // Add followers of the requesting user to the reply
-    for (Client* follower : requesting_user->client_followers) {
-      list_reply->add_followers(follower->username);
+
+    std::vector<FollowRecord> followers = get_follower_records(username);
+    for (const auto& follower : followers) {
+      list_reply->add_followers(follower.username);
     }
-    
-    log(INFO, std::string(is_master ? "MASTER" : "SLAVE") + " List request completed for user: " + username + 
-              ", total users: " + std::to_string(client_db.size()) + 
-              ", followers: " + std::to_string(requesting_user->client_followers.size()));
-    
+
+    log(INFO, std::string(is_master ? "MASTER" : "SLAVE") + " List request completed for user: " + username +
+              ", total users: " + std::to_string(all_users.size()) +
+              ", followers: " + std::to_string(followers.size()));
+
     return Status::OK;
   }
 
@@ -520,54 +520,21 @@ class SNSServiceImpl final : public SNSService::Service {
       return Status::OK;
     }
 
-    // Find the follower and target users
-    Client* follower_client = nullptr;
-    Client* target_client = nullptr;
-
-    for (Client* client : client_db) {
-      if (client->username == follower_username) {
-        follower_client = client;
-      }
-      if (client->username == target_username) {
-        target_client = client;
-      }
-    }
-
-    // Check if target user exists
-    if (target_client == nullptr) {
+    if (!user_exists(follower_username) || !user_exists(target_username)) {
       reply->set_msg("FAILURE_INVALID_USERNAME");
-      log(WARNING, "Follow request: target user " + target_username + " does not exist");
+      log(WARNING, "Follow request: invalid user(s) follower=" + follower_username + " target=" + target_username);
       return Status::OK;
     }
 
-    // Check if follower exists
-    // should never be null since they must be logged in to follow
-    if (follower_client == nullptr) {
-      reply->set_msg("FAILURE_INVALID_USERNAME");
-      log(WARNING, "Follow request: follower user " + follower_username + " does not exist");
-      return Status::OK;
-    }
-
-    // Check if already following
-    for (Client* following : follower_client->client_following) {
-      if (following->username == target_username) {
-        reply->set_msg("FAILURE_ALREADY_EXISTS");
-        log(INFO, "Follow request: " + follower_username + " already follows " + target_username);
-        return Status::OK;
-      }
-    }
-
-    // Add the relationship
-    follower_client->client_following.push_back(target_client);
-    target_client->client_followers.push_back(follower_client);
-
-    // Persist follow relationship to files
-    add_following_to_file(follower_username, target_username);
-    add_follower_to_file(target_username, follower_username);
-
-    // Record the follow time
     std::time_t follow_time = std::time(nullptr);
-    follower_client->follow_times[target_username] = follow_time;
+
+    if (!add_following_to_file(follower_username, target_username, follow_time)) {
+      reply->set_msg("FAILURE_ALREADY_EXISTS");
+      log(INFO, "Follow request: " + follower_username + " already follows " + target_username);
+      return Status::OK;
+    }
+
+    add_follower_to_file(target_username, follower_username, follow_time);
 
     reply->set_msg("SUCCESS");
     log(INFO, std::string(is_master ? "MASTER" : "SLAVE") + " Follow request successful: " + follower_username + " now follows " + target_username +
@@ -599,63 +566,19 @@ class SNSServiceImpl final : public SNSService::Service {
       return Status::OK;
     }
     
-    // Find the follower and target users
-    Client* follower_client = nullptr;
-    Client* target_client = nullptr;
-    
-    for (Client* client : client_db) {
-      if (client->username == follower_username) {
-        follower_client = client;
-      }
-      if (client->username == target_username) {
-        target_client = client;
-      }
-    }
-    
-    // Check if target user exists
-    if (target_client == nullptr) {
+    if (!user_exists(follower_username) || !user_exists(target_username)) {
       reply->set_msg("FAILURE_INVALID_USERNAME");
-      log(WARNING, "UnFollow request: target user " + target_username + " does not exist");
+      log(WARNING, "UnFollow request: invalid user(s) follower=" + follower_username + " target=" + target_username);
       return Status::OK;
-    }
-    
-    // Check if follower exists
-    if (follower_client == nullptr) {
-      reply->set_msg("FAILURE_INVALID_USERNAME");
-      log(WARNING, "UnFollow request: follower user " + follower_username + " does not exist");
-      return Status::OK;
-    }
-    
-    // Check if currently following and remove the relationship
-    bool was_following = false;
-    
-    // Remove from follower's following list
-    for (auto it = follower_client->client_following.begin(); it != follower_client->client_following.end(); ++it) {
-      if ((*it)->username == target_username) {
-        follower_client->client_following.erase(it);
-        was_following = true;
-        break;
-      }
-    }
-    
-    // Remove from target's followers list
-    if (was_following) {
-      for (auto it = target_client->client_followers.begin(); it != target_client->client_followers.end(); ++it) {
-        if ((*it)->username == follower_username) {
-          target_client->client_followers.erase(it);
-          break;
-        }
-      }
-      
-      // Remove the follow time record
-      follower_client->follow_times.erase(target_username);
     }
 
-    if (!was_following) {
+    if (!remove_following_from_file(follower_username, target_username)) {
       reply->set_msg("FAILURE_NOT_A_FOLLOWER");
       log(INFO, "UnFollow request: " + follower_username + " was not following " + target_username);
       return Status::OK;
     }
+
+    remove_follower_from_file(target_username, follower_username);
 
     reply->set_msg("SUCCESS");
     log(INFO, std::string(is_master ? "MASTER" : "SLAVE") + " UnFollow request successful: " + follower_username + " no longer follows " + target_username);
@@ -678,38 +601,25 @@ class SNSServiceImpl final : public SNSService::Service {
       return Status::OK;
     }
 
-    // Check if user already exists and is connected
-    for (Client* client : client_db) {
-      if (client->username == username && client->connected) {
+    {
+      std::lock_guard<std::mutex> lock(active_users_mutex);
+      if (active_users.find(username) != active_users.end()) {
         reply->set_msg("FAILURE_ALREADY_EXISTS");
         log(WARNING, "Login request: user " + username + " already connected");
         return Status::OK;
       }
     }
 
-    // Check if user exists but is disconnected
-    Client* existing_client = nullptr;
-    for (Client* client : client_db) {
-      if (client->username == username) {
-        existing_client = client;
-        break;
-      }
+    if (!user_exists(username)) {
+      add_user_to_all_users_file(username);
+      log(INFO, "New user " + username + " created");
+    } else {
+      log(INFO, "User " + username + " reconnected");
     }
 
-    if (existing_client != nullptr) {
-      // User exists but was disconnected, reconnect them
-      existing_client->connected = true;
-      log(INFO, "User " + username + " reconnected");
-    } else {
-      // Create new user
-      Client* new_client = new Client();
-      new_client->username = username;
-      new_client->connected = true;
-      client_db.push_back(new_client);
-
-      // Persist new user to all_users.txt
-      add_user_to_all_users_file(username);
-      log(INFO, "New user " + username + " created and connected");
+    {
+      std::lock_guard<std::mutex> lock(active_users_mutex);
+      active_users.insert(username);
     }
 
     reply->set_msg("SUCCESS");
@@ -725,154 +635,115 @@ class SNSServiceImpl final : public SNSService::Service {
 		ServerReaderWriter<Message, Message>* stream) override {
 
     Message message;
-    Client* user_client = nullptr;
 
-    // Read the first message to identify the user
-    if (stream->Read(&message)) {
-      std::string username = message.username();
-      log(INFO, "Timeline request from user: " + username);
+    if (!stream->Read(&message)) {
+      return Status::OK;
+    }
 
-      user_client = find_user(username);
-      if (user_client == nullptr) {
-        log(ERROR, "Timeline request from non-existent user: " + username);
-        return Status::OK;
-      }
+    std::string username = message.username();
+    log(INFO, "Timeline request from user: " + username);
 
-      // Set the stream for this client
-      user_client->stream = stream;
+    if (!user_exists(username)) {
+      log(ERROR, "Timeline request from non-existent user: " + username);
+      return Status::OK;
+    }
 
-      // Send last 20 posts from users this client is following
-      std::vector<Message> timeline_messages;
+    EnsureServerDirectory();
 
-      for (Client* following : user_client->client_following) {
-        // Get the follow time for this user
-        std::time_t follow_time = 0;
-        auto follow_time_it = user_client->follow_times.find(following->username);
-        if (follow_time_it != user_client->follow_times.end()) {
-          follow_time = follow_time_it->second;
-        }
+    {
+      std::lock_guard<std::mutex> lock(stream_mutex);
+      active_streams[username] = stream;
+    }
 
-        // Only get messages posted after we started following this user
-        std::vector<Message> user_messages = read_last_messages(following->username, 20, follow_time);
-        timeline_messages.insert(timeline_messages.end(), user_messages.begin(), user_messages.end());
+    auto following_records = get_following_records(username);
+    std::vector<Message> timeline_messages = collect_timeline_messages(following_records);
+    int count = 0;
+    for (const Message& msg : timeline_messages) {
+      if (count >= 20) break;
+      stream->Write(msg);
+      count++;
+    }
+    log(INFO, "Sent " + std::to_string(count) + " timeline messages to user: " + username);
 
-        log(INFO, "Retrieved " + std::to_string(user_messages.size()) + " messages from " +
-                  following->username + " after follow time " + std::to_string(follow_time));
-      }
+    std::atomic<bool> timeline_active(true);
 
-      // Sort messages by timestamp (newest first)
-      std::sort(timeline_messages.begin(), timeline_messages.end(),
-                [](const Message& a, const Message& b) {
-                  return a.timestamp().seconds() > b.timestamp().seconds();
-                });
-
-      // Send last 20 messages
-      int count = 0;
-      for (const Message& msg : timeline_messages) {
-        if (count >= 20) break;
-        stream->Write(msg);
-        count++;
-      }
-
-      log(INFO, "Sent " + std::to_string(count) + " timeline messages to user: " + username);
-
-      // Track last modification times of followed users' timeline files
+    std::thread monitor_thread([&, username]() {
       std::map<std::string, std::time_t> last_mtime;
-      for (Client* following : user_client->client_following) {
-        std::string filename = server_directory + "/" + following->username + ".txt";
-        last_mtime[following->username] = get_file_mtime(filename);
-      }
 
-      // Flag to control monitoring thread
-      bool timeline_active = true;
-
-      // Start file monitoring thread
-      std::thread monitor_thread([&]() {
-        while (timeline_active && user_client->stream != nullptr) {
-          sleep(5); // Check every 5 seconds
-
-          if (!timeline_active || user_client->stream == nullptr) break;
-
-          std::time_t current_time = std::time(nullptr);
-
-          for (Client* following : user_client->client_following) {
-            std::string filename = server_directory + "/" + following->username + ".txt";
-            std::time_t current_mtime = get_file_mtime(filename);
-
-            // Check if file was modified since last check
-            if (current_mtime > last_mtime[following->username]) {
-              // Check if file was modified in the last 30 seconds
-              if (difftime(current_time, current_mtime) <= 30) {
-                log(INFO, "Timeline file for " + following->username + " modified recently, re-sending posts to " + username);
-
-                // Re-send latest 20 posts from all followed users
-                std::vector<Message> updated_timeline;
-
-                for (Client* f : user_client->client_following) {
-                  std::time_t follow_time = 0;
-                  auto follow_time_it = user_client->follow_times.find(f->username);
-                  if (follow_time_it != user_client->follow_times.end()) {
-                    follow_time = follow_time_it->second;
-                  }
-
-                  std::vector<Message> user_messages = read_last_messages(f->username, 20, follow_time);
-                  updated_timeline.insert(updated_timeline.end(), user_messages.begin(), user_messages.end());
-                }
-
-                // Sort by timestamp (newest first)
-                std::sort(updated_timeline.begin(), updated_timeline.end(),
-                          [](const Message& a, const Message& b) {
-                            return a.timestamp().seconds() > b.timestamp().seconds();
-                          });
-
-                // Send latest 20 messages
-                int msg_count = 0;
-                for (const Message& msg : updated_timeline) {
-                  if (msg_count >= 20) break;
-                  if (user_client->stream != nullptr) {
-                    user_client->stream->Write(msg);
-                    msg_count++;
-                  }
-                }
-
-                log(INFO, "Re-sent " + std::to_string(msg_count) + " updated timeline messages to " + username);
-              }
-
-              // Update last modification time
-              last_mtime[following->username] = current_mtime;
-            }
+      auto sync_last_mtime = [&](const std::vector<FollowRecord>& records) {
+        std::unordered_set<std::string> seen;
+        for (const auto& rec : records) {
+          seen.insert(rec.username);
+          if (last_mtime.find(rec.username) == last_mtime.end()) {
+            std::string filename = server_directory + "/" + rec.username + ".txt";
+            last_mtime[rec.username] = get_file_mtime(filename);
           }
         }
-      });
-
-      // Handle real-time message posting
-      while (stream->Read(&message)) {
-        if (message.username() == username) {
-          log(INFO, "New message from " + username + ": " + message.msg());
-
-          // Write message to user's own file
-          write_message_to_file(username, message);
-
-          // Broadcast to all followers who are in timeline mode
-          for (Client* follower : user_client->client_followers) {
-            if (follower->stream != nullptr) {
-              follower->stream->Write(message);
-              log(INFO, "Broadcasted message from " + username + " to follower: " + follower->username);
-            }
+        for (auto it = last_mtime.begin(); it != last_mtime.end();) {
+          if (seen.find(it->first) == seen.end()) {
+            it = last_mtime.erase(it);
+          } else {
+            ++it;
           }
         }
+      };
+
+      auto initial_following = get_following_records(username);
+      sync_last_mtime(initial_following);
+
+      while (timeline_active.load()) {
+        sleep(5);
+        if (!timeline_active.load()) {
+          break;
+        }
+
+        auto current_following = get_following_records(username);
+        sync_last_mtime(current_following);
+        std::time_t current_time = std::time(nullptr);
+
+        for (const auto& record : current_following) {
+          std::string filename = server_directory + "/" + record.username + ".txt";
+          std::time_t current_mtime = get_file_mtime(filename);
+
+          if (current_mtime > last_mtime[record.username] &&
+              difftime(current_time, current_mtime) <= 30) {
+            log(INFO, "Timeline file for " + record.username + " modified recently, re-sending posts to " + username);
+
+            std::vector<Message> updated_timeline = collect_timeline_messages(current_following);
+            int msg_count = 0;
+            for (const Message& msg : updated_timeline) {
+              if (msg_count >= 20) break;
+              stream->Write(msg);
+              msg_count++;
+            }
+
+            log(INFO, "Re-sent " + std::to_string(msg_count) + " updated timeline messages to " + username);
+          }
+
+          last_mtime[record.username] = current_mtime;
+        }
       }
+    });
 
-      // Client disconnected from timeline - stop monitoring
-      timeline_active = false;
-      user_client->stream = nullptr;
-      log(INFO, "User " + username + " disconnected from timeline");
-
-      // Wait for monitoring thread to finish
-      if (monitor_thread.joinable()) {
-        monitor_thread.join();
+    while (stream->Read(&message)) {
+      if (message.username() == username) {
+        log(INFO, "New message from " + username + ": " + message.msg());
+        write_message_to_file(username, message);
+        broadcast_to_followers(username, message);
       }
     }
+
+    timeline_active = false;
+    {
+      std::lock_guard<std::mutex> lock(stream_mutex);
+      active_streams.erase(username);
+    }
+
+    if (monitor_thread.joinable()) {
+      monitor_thread.join();
+    }
+
+    log(INFO, "User " + username + " disconnected from timeline");
 
     return Status::OK;
   }
@@ -945,6 +816,7 @@ int main(int argc, char** argv) {
   coordinator_hostname = coord_hostname;
   coordinator_port = coord_port;
   server_port = port;
+  RefreshServerDirectory();
 
   std::string log_file_name = std::string("server-") + cluster_id + "-" + server_id;
   FLAGS_log_prefix = false;

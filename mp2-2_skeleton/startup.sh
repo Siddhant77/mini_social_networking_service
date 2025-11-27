@@ -25,12 +25,20 @@ sleep 1
 
 echo "STARTING SYNCHRONIZER PROCESSES"
 
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9001 -i 1 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9002 -i 2 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9003 -i 3 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9001 -i 1 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9002 -i 2 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9003 -i 3 &
+
+./synchronizer -h localhost -k 9000 -p 9001 -i 1 &
+./synchronizer -h localhost -k 9000 -p 9002 -i 2 &
+./synchronizer -h localhost -k 9000 -p 9003 -i 3 &
 
 sleep 1 
 
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9004 -i 4 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9005 -i 5 &
-GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9006 -i 6 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9004 -i 4 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9005 -i 5 &
+# GLOG_logtostderr=1 ./synchronizer -h localhost -k 9000 -p 9006 -i 6 &
+
+./synchronizer -h localhost -k 9000 -p 9004 -i 4 &
+./synchronizer -h localhost -k 9000 -p 9005 -i 5 &
+./synchronizer -h localhost -k 9000 -p 9006 -i 6 &

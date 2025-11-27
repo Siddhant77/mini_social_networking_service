@@ -37,9 +37,11 @@ import "google/protobuf/timestamp.proto";
 service SNSService {
 
   rpc Login(Request) returns (Reply) {}
+  rpc Disconnect(Request) returns (Reply) {}
   rpc List(Request) returns (ListReply) {}
   rpc Follow(Request) returns (Reply) {}
   rpc UnFollow(Request) returns (Reply) {}
+  rpc MirrorPost(Message) returns (Reply) {}
   // Bidirectional streaming RPC
   rpc Timeline(stream Message) returns (stream Message) {}
 }

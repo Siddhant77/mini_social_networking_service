@@ -107,6 +107,10 @@ std::unordered_set<std::string> active_users;
 std::mutex stream_mutex;
 std::unordered_map<std::string, ServerReaderWriter<Message, Message>*> active_streams;
 
+// Global tracking of sent posts per user to prevent duplicates across broadcasts and file monitoring
+std::mutex sent_posts_mutex;
+std::unordered_map<std::string, std::unordered_set<std::string>> user_sent_posts;
+
 std::vector<Message> read_last_messages(const std::string& username, int count, std::time_t after_time);
 
 cluster_files::ClusterFilesContext CurrentClusterContext() {
@@ -228,8 +232,39 @@ std::vector<Message> collect_timeline_messages(const std::vector<FollowRecord>& 
   return timeline_messages;
 }
 
+// Mirror a post from master to slave
+void mirror_post_to_slave(const Message& message) {
+  // Only mirror if this is the master and we have a slave
+  if (!is_master || !global_slave_stub) {
+    return;
+  }
+
+  try {
+    ClientContext context;
+    Reply reply;
+
+    // Call MirrorTimeline on the slave
+    auto status = global_slave_stub->MirrorPost(&context, message, &reply);
+
+    if (status.ok()) {
+      log(INFO, "Mirrored post from " + message.username() + " to slave");
+    } else {
+      log(ERROR, "Failed to mirror post to slave: " + status.error_message());
+    }
+  } catch (const std::exception& e) {
+    log(ERROR, "Exception while mirroring post to slave: " + std::string(e.what()));
+  }
+}
+
 void broadcast_to_followers(const std::string& username, const Message& message) {
   std::vector<FollowRecord> followers = get_follower_records(username);
+
+  // Create post key for deduplication (matching the format used in monitor thread)
+  std::time_t msg_time = message.timestamp().seconds();
+  std::string time_str = std::ctime(&msg_time);
+  time_str.pop_back();  // Remove newline
+  std::string post_key = "T " + time_str + "|U " + message.username() + "|W " + message.msg();
+
   for (const auto& follower : followers) {
     ServerReaderWriter<Message, Message>* follower_stream = nullptr;
     {
@@ -241,12 +276,135 @@ void broadcast_to_followers(const std::string& username, const Message& message)
     }
     if (follower_stream != nullptr) {
       follower_stream->Write(message);
+
+      // Track this post as sent to this follower to prevent duplicate from monitor thread
+      {
+        std::lock_guard<std::mutex> lock(sent_posts_mutex);
+        user_sent_posts[follower.username].insert(post_key);
+      }
+
       log(INFO, "Broadcasted message from " + username + " to follower: " + follower.username);
     }
   }
 }
 
+// Helper function to generate unique key for a timeline post (for deduplication)
+std::string get_timeline_post_key(const cluster_files::TimelinePost& post) {
+  return post.timestamp + "|" + post.user + "|" + post.message;
+}
 
+// Convert TimelinePost to Message protobuf
+Message timeline_post_to_message(const cluster_files::TimelinePost& post) {
+  Message msg;
+
+  // Extract username from "U username"
+  if (post.user.size() > 2) {
+    msg.set_username(post.user.substr(2));
+  }
+
+  // Extract message from "W message"
+  if (post.message.size() > 2) {
+    msg.set_msg(post.message.substr(2));
+  }
+
+  // Parse timestamp from "T timestamp_string"
+  if (post.timestamp.size() > 2) {
+    std::string time_str = post.timestamp.substr(2);
+    struct tm tm = {};
+    strptime(time_str.c_str(), "%a %b %d %H:%M:%S %Y", &tm);
+    std::time_t msg_time = mktime(&tm);
+
+    google::protobuf::Timestamp* timestamp = new google::protobuf::Timestamp();
+    timestamp->set_seconds(msg_time);
+    timestamp->set_nanos(0);
+    msg.set_allocated_timestamp(timestamp);
+  }
+
+  return msg;
+}
+
+// Monitor thread function: periodically checks for new timeline messages from followed users
+void timeline_monitor_thread(
+    const std::string& username,
+    const std::vector<FollowRecord>& following_records,
+    ServerReaderWriter<Message, Message>* stream,
+    std::atomic<bool>& is_active) {
+
+  cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+  log(INFO, "Monitor thread started for user: " + username + " with " + std::to_string(following_records.size()) + " followed users");
+
+  // Map to track last modification times of followed users' timeline files
+  std::unordered_map<std::string, std::time_t> last_mod_times;
+
+  // Initialize last modification times
+  for (const auto& record : following_records) {
+    std::time_t mtime = cluster_files::GetTimelineFileModTime(ctx, record.username);
+    last_mod_times[record.username] = mtime;
+    // log(INFO, "Monitor: Following user " + record.username + ", initial mtime=" + std::to_string(mtime));
+  }
+
+  // Monitor loop
+  int iteration = 0;
+  while (is_active) {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    if (!is_active) {
+      // log(INFO, "Monitor thread stopping for user: " + username);
+      break;
+    }
+
+    iteration++;
+    // Check each followed user's timeline file for updates
+    for (const auto& record : following_records) {
+      std::time_t current_mod_time = cluster_files::GetTimelineFileModTime(ctx, record.username);
+      std::time_t last_mtime = last_mod_times[record.username];
+
+      // log(INFO, "Monitor iteration " + std::to_string(iteration) + " for " + username +
+      //     " checking " + record.username + ": current_mtime=" + std::to_string(current_mod_time) +
+      //     " last_mtime=" + std::to_string(last_mtime));
+
+      // Check if file has been modified since last check
+      if (current_mod_time > 0 && current_mod_time > last_mtime) {
+        // log(INFO, "File modified detected for " + record.username + "! Reading new posts...");
+
+        // Get the current sent posts set for this user
+        std::unordered_set<std::string> current_sent_posts;
+        {
+          std::lock_guard<std::mutex> lock(sent_posts_mutex);
+          current_sent_posts = user_sent_posts[username];
+        }
+
+        // File has been modified, read new messages
+        std::vector<cluster_files::TimelinePost> new_posts = cluster_files::ReadNewTimelinePosts(
+            ctx,
+            record.username,
+            record.timestamp,
+            current_sent_posts
+        );
+
+        // log(INFO, "Read " + std::to_string(new_posts.size()) + " new posts from " + record.username);
+
+        // Send new posts to client
+        for (const auto& post : new_posts) {
+          Message msg = timeline_post_to_message(post);
+          stream->Write(msg);
+
+          // Add to global sent_posts set
+          {
+            std::lock_guard<std::mutex> lock(sent_posts_mutex);
+            user_sent_posts[username].insert(get_timeline_post_key(post));
+          }
+
+          // log(INFO, "Sent new message from " + record.username + " to " + username +
+          //     ": " + msg.msg());
+        }
+
+        // Update last modification time
+        last_mod_times[record.username] = current_mod_time;
+      }
+    }
+  }
+}
 
 // Helper function to write message to file in the required format
 void write_message_to_file(const std::string& username, const Message& message) {
@@ -436,12 +594,15 @@ bool mirrorToSlave(const Request& request, Reply* reply, const std::string& meth
   ClientContext context;
   if (method == "Login") {
     return global_slave_stub->Login(&context, request, reply).ok();
-  } 
+  }
   else if (method == "Follow") {
     return global_slave_stub->Follow(&context, request, reply).ok();
-  } 
+  }
   else if (method == "UnFollow") {
     return global_slave_stub->UnFollow(&context, request, reply).ok();
+  }
+  else if (method == "Disconnect") {
+    return global_slave_stub->Disconnect(&context, request, reply).ok();
   }
   return true;
 }
@@ -630,6 +791,28 @@ class SNSServiceImpl final : public SNSService::Service {
     return Status::OK;
   }
 
+  Status Disconnect(ServerContext* context, const Request* request, Reply* reply) override {
+    std::string username = request->username();
+    log(INFO, "Disconnect request from user: " + username);
+
+    {
+      std::lock_guard<std::mutex> lock(active_users_mutex);
+      if (active_users.find(username) != active_users.end()) {
+        active_users.erase(username);
+        log(INFO, "User " + username + " disconnected");
+      } else {
+        log(WARNING, "Disconnect request from non-active user: " + username);
+      }
+    }
+
+    reply->set_msg("SUCCESS");
+
+    // Mirror to Slave if Master
+    mirrorToSlave(*request, reply, "Disconnect");
+
+    return Status::OK;
+  }
+
   Status Timeline(ServerContext* context,
 		ServerReaderWriter<Message, Message>* stream) override {
 
@@ -656,29 +839,89 @@ class SNSServiceImpl final : public SNSService::Service {
 
     auto following_records = get_following_records(username);
     std::vector<Message> timeline_messages = collect_timeline_messages(following_records);
+
+    // Initialize global sent posts set for this user
+    {
+      std::lock_guard<std::mutex> lock(sent_posts_mutex);
+      user_sent_posts[username].clear();
+    }
+
+    // Send initial 20 messages and track them globally
     int count = 0;
     for (const Message& msg : timeline_messages) {
       if (count >= 20) break;
       stream->Write(msg);
+
+      // Add to global sent_posts set for live updates deduplication
+      std::time_t msg_time = msg.timestamp().seconds();
+      std::string time_str = std::ctime(&msg_time);
+      time_str.pop_back();  // Remove newline
+      std::string post_key = "T " + time_str + "|U " + msg.username() + "|W " + msg.msg();
+      {
+        std::lock_guard<std::mutex> lock(sent_posts_mutex);
+        user_sent_posts[username].insert(post_key);
+      }
+
       count++;
     }
     log(INFO, "Sent " + std::to_string(count) + " timeline messages to user: " + username);
+
+    // Start monitor thread for live timeline updates
+    std::atomic<bool> monitor_active(true);
+    std::thread monitor(timeline_monitor_thread, username, following_records, stream, std::ref(monitor_active));
+    monitor.detach();
 
     while (stream->Read(&message)) {
       if (message.username() == username) {
         log(INFO, "New message from " + username + ": " + message.msg());
         write_message_to_file(username, message);
         broadcast_to_followers(username, message);
+        mirror_post_to_slave(message);
       }
     }
+
+    // Signal monitor thread to stop
+    monitor_active = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     {
       std::lock_guard<std::mutex> lock(stream_mutex);
       active_streams.erase(username);
     }
 
+    // Clean up sent posts tracking for this user
+    {
+      std::lock_guard<std::mutex> lock(sent_posts_mutex);
+      user_sent_posts.erase(username);
+    }
+
     log(INFO, "User " + username + " disconnected from timeline");
 
+    return Status::OK;
+  }
+
+  Status MirrorPost(ServerContext* context, const Message* message, Reply* reply) override {
+
+    std::string username = message->username();
+    log(INFO, "Slave received mirrored post from user: " + username);
+
+    // Write the message to the poster's timeline file
+    write_message_to_file(username, *message);
+
+    // Also add to cluster_files for synchronization
+    cluster_files::TimelinePost post;
+    std::time_t msg_time = message->timestamp().seconds();
+    std::string time_str = std::ctime(&msg_time);
+    time_str.pop_back();  // Remove newline
+    post.timestamp = "T " + time_str;
+    post.user = "U " + message->username();
+    post.message = "W " + message->msg();
+
+    cluster_files::ClusterFilesContext ctx = CurrentClusterContext();
+    cluster_files::WriteTimelinePost(ctx, username, post);
+
+    reply->set_msg("SUCCESS");
+    log(INFO, "Slave mirrored post from user: " + username);
     return Status::OK;
   }
 

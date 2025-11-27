@@ -28,8 +28,25 @@ using csce438::CoordService;
 using csce438::ServerInfo;
 using csce438::ID;
 
+// Global variables for signal handler
+static std::unique_ptr<SNSService::Stub>* g_stub = nullptr;
+static std::string g_username = "";
+
 void sig_ignore(int sig) {
-  std::cout << "Signal caught " + sig;
+  if (sig == SIGINT && g_stub && !g_username.empty()) {
+    std::cout << "\nReceived SIGINT, disconnecting gracefully...\n";
+    try {
+      Request request;
+      request.set_username(g_username);
+      Reply reply;
+      ClientContext context;
+      (*g_stub)->Disconnect(&context, request, &reply);
+      std::cout << "Disconnected from server\n";
+    } catch (const std::exception& e) {
+      std::cerr << "Error during disconnect: " << e.what() << "\n";
+    }
+    exit(0);
+  }
 }
 
 Message MakeMessage(const std::string& username, const std::string& msg) {
@@ -52,7 +69,11 @@ public:
 	 const std::string& p)
     :hostname(hname), username(uname), port(p) {}
 
-  
+  // Get stub for signal handler
+  std::unique_ptr<SNSService::Stub>* getStub() {
+    return &stub_;
+  }
+
 protected:
   virtual int connectTo();
   virtual IReply processCommand(std::string& input);
@@ -534,16 +555,21 @@ int main(int argc, char** argv) {
   }
       
   std::cout << "Logging Initialized. Client starting...";
-  
+
   // Initialize Google Logging
   std::string log_file_name = std::string("client-") + username + "-" + port;
   FLAGS_log_prefix = false;
   google::InitGoogleLogging(log_file_name.c_str());
   log(INFO, "Client logging initialized for user: " + username);
-  
+
   Client myc(hostname, username, port);
-  
+
+  // Set up signal handler for graceful disconnect
+  g_username = username;
+  g_stub = myc.getStub();
+  signal(SIGINT, sig_ignore);
+
   myc.run();
-  
+
   return 0;
 }

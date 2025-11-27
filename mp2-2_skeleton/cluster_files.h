@@ -3,6 +3,9 @@
 
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <ctime>
+
 
 namespace cluster_files {
 
@@ -45,6 +48,16 @@ struct TimelinePost {
 std::vector<TimelinePost> ReadTimelineAsStructuredPosts(const ClusterFilesContext &ctx, const std::string &username);
 
 void WriteTimelinePost(const ClusterFilesContext &ctx, const std::string &username, const TimelinePost &post);
+
+// Get the last modification time of a timeline file
+std::time_t GetTimelineFileModTime(const ClusterFilesContext &ctx, const std::string &username);
+
+// Read new timeline messages since a given follow time, excluding already sent posts
+std::vector<TimelinePost> ReadNewTimelinePosts(
+    const ClusterFilesContext &ctx,
+    const std::string &username,
+    std::time_t follow_time,
+    const std::unordered_set<std::string> &sent_post_keys);
 
 bool FileContainsEntry(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, const std::string &value);
 

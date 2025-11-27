@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <ctime>
 #include <iostream>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -201,6 +202,107 @@ void WriteTimelinePost(const ClusterFilesContext &ctx, const std::string &userna
         file << post.message << std::endl;
         file << std::endl;  // Blank line
     }
+}
+
+std::time_t GetTimelineFileModTime(const ClusterFilesContext &ctx, const std::string &username) {
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    try {
+        if (fs::exists(path)) {
+            auto last_write = fs::last_write_time(path);
+            // Convert filesystem time to system_clock time, then to time_t
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                last_write - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+            );
+            auto tt = std::chrono::system_clock::to_time_t(sctp);
+            // std::cout << "[GetTimelineFileModTime] File " << path << " mtime=" << tt << std::endl;
+            return tt;
+        }
+    } catch (const std::exception &e) {
+        // std::cout << "[GetTimelineFileModTime] Error: " << e.what() << " for " << path << std::endl;
+    }
+    // std::cout << "[GetTimelineFileModTime] File not found: " << path << std::endl;
+    return 0;
+}
+
+std::vector<TimelinePost> ReadNewTimelinePosts(
+    const ClusterFilesContext &ctx,
+    const std::string &username,
+    std::time_t follow_time,
+    const std::unordered_set<std::string> &sent_post_keys) {
+
+    std::vector<TimelinePost> new_posts;
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    std::string sem_name = GetSemaphoreName(ctx, UserFileType::kTimeline, username);
+    FileSemaphoreLock lock(sem_name);
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        // std::cout << "[ReadNewTimelinePosts] File not found: " << path << std::endl;
+        return new_posts;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        lines.push_back(line);
+    }
+    // std::cout << "[ReadNewTimelinePosts] Read " << lines.size() << " lines from " << username << std::endl;
+
+    // Parse posts: each post is T line, U line, W line, blank line
+    int posts_parsed = 0;
+    int posts_filtered_by_time = 0;
+    int posts_filtered_by_dedup = 0;
+
+    for (std::size_t i = 0; i + 3 < lines.size(); i += 4) {
+        // Check if we have a valid post structure: T, U, W, blank
+        if (lines[i].size() >= 2 && lines[i].substr(0, 2) == "T " &&
+            lines[i+1].size() >= 2 && lines[i+1].substr(0, 2) == "U " &&
+            lines[i+2].size() >= 2 && lines[i+2].substr(0, 2) == "W " &&
+            lines[i+3].empty()) {
+
+            posts_parsed++;
+
+            // Parse timestamp
+            std::string time_str = lines[i].substr(2);
+            struct tm tm = {};
+            strptime(time_str.c_str(), "%a %b %d %H:%M:%S %Y", &tm);
+            std::time_t msg_time = mktime(&tm);
+
+            // std::cout << "[ReadNewTimelinePosts] Post " << posts_parsed << " from " << username
+            //           << " - msg_time=" << msg_time << " follow_time=" << follow_time << std::endl;
+
+            // Sanity check 1: Post made after following time
+            if (msg_time <= follow_time) {
+                // std::cout << "[ReadNewTimelinePosts] Filtered by time: " << lines[i] << std::endl;
+                posts_filtered_by_time++;
+                continue;
+            }
+
+            // Create post key for deduplication
+            std::string post_key = lines[i] + "|" + lines[i+1] + "|" + lines[i+2];
+
+            // Sanity check 2: Post not already sent
+            if (sent_post_keys.find(post_key) != sent_post_keys.end()) {
+                // std::cout << "[ReadNewTimelinePosts] Filtered by dedup: " << lines[i] << std::endl;
+                posts_filtered_by_dedup++;
+                continue;
+            }
+
+            // Create TimelinePost
+            TimelinePost post;
+            post.timestamp = lines[i];
+            post.user = lines[i+1];
+            post.message = lines[i+2];
+            new_posts.push_back(post);
+            // std::cout << "[ReadNewTimelinePosts] Added new post: " << lines[i] << std::endl;
+        }
+    }
+
+    // std::cout << "[ReadNewTimelinePosts] Summary for " << username << ": parsed=" << posts_parsed
+    //           << " filtered_by_time=" << posts_filtered_by_time << " filtered_by_dedup=" << posts_filtered_by_dedup
+    //           << " new=" << new_posts.size() << std::endl;
+
+    return new_posts;
 }
 
 bool FileContainsEntry(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, const std::string &value) {

@@ -304,7 +304,7 @@ class CoordServiceImpl final : public CoordService::Service {
 
         v_mutex.unlock();
 
-        log(INFO, "GetAllSynchronizers: returning " + std::to_string(synchronizers.size()) + " synchronizers");
+        // log(INFO, "GetAllSynchronizers: returning " + std::to_string(synchronizers.size()) + " synchronizers");
         return Status::OK;
     }
 
@@ -367,8 +367,8 @@ class CoordServiceImpl final : public CoordService::Service {
         int client_id = id->id();
         int cluster_id = ((client_id - 1) % 3) + 1;
 
-        log(INFO, "GetAllFollowerServers request for client " + std::to_string(client_id) +
-                  " in cluster " + std::to_string(cluster_id));
+        // log(INFO, "GetAllFollowerServers request for client " + std::to_string(client_id) +
+        //           " in cluster " + std::to_string(cluster_id));
 
         v_mutex.lock();
 
@@ -384,8 +384,8 @@ class CoordServiceImpl final : public CoordService::Service {
 
         v_mutex.unlock();
 
-        log(INFO, "GetAllFollowerServers: returning " + std::to_string(serverlist->serverid_size()) +
-                  " servers for client " + std::to_string(client_id));
+        // log(INFO, "GetAllFollowerServers: returning " + std::to_string(serverlist->serverid_size()) +
+        //           " servers for client " + std::to_string(client_id));
         return Status::OK;
     }
 
@@ -393,8 +393,8 @@ class CoordServiceImpl final : public CoordService::Service {
         int client_id = id->id();
         int cluster_id = ((client_id - 1) % 3) + 1;
 
-        log(INFO, "GetFollowerServer request for client " + std::to_string(client_id) +
-                  " in cluster " + std::to_string(cluster_id));
+        // log(INFO, "GetFollowerServer request for client " + std::to_string(client_id) +
+        //           " in cluster " + std::to_string(cluster_id));
 
         v_mutex.lock();
 

@@ -121,7 +121,6 @@ cluster_files::ClusterFilesContext CurrentClusterContext() {
     if (clusterSubdirectory.empty()) {
         clusterSubdirectory = (synchID <= 3) ? "1" : "2";
     }
-
     return cluster_files::MakeContext(clusterID, clusterSubdirectory);
 }
 
@@ -212,7 +211,10 @@ private:
         } else if (messageType == "timeline") {
             channel = publish_timeline_channel;
         }
-        log(INFO, "publishMessage " + std::string(message) + " to RabbitMQ queue: " + std::string(queueName) + " on channel " + std::to_string(channel) + " (" + channelName(channel) + ")");
+        if (channel == publish_timeline_channel){
+            log(INFO, "publishMessage " + std::string(message) + " to RabbitMQ queue: " + std::string(queueName) + " on channel " + std::to_string(channel) + " (" + channelName(channel) + ")");
+        }
+
         amqp_basic_publish(conn, channel, amqp_empty_bytes, amqp_cstring_bytes(queueName.c_str()),
                            0, 0, NULL, amqp_cstring_bytes(message.c_str()));
     }
@@ -239,6 +241,10 @@ private:
         });
 
         std::string message = dispatch_queues[channel].front();
+        if (channel == consume_timeline_channel){
+            log(INFO, "consumeMessage " + message + " from channel: " + std::to_string(channel) + " (" + channelName(channel) + ")");        
+        }
+
         dispatch_queues[channel].pop();
         return message;
     }
@@ -354,7 +360,7 @@ public:
         for (int i = 0; i < allSynchronizers.serverid_size(); i++) {
             int serverId = allSynchronizers.serverid(i);
             if (serverId != synchID) {
-                log(INFO, "S_" + std::to_string(synchID) + " publish " + message + " to " + get_user_queue(serverId));
+                // log(INFO, "S_" + std::to_string(synchID) + " publish " + message + " to " + get_user_queue(serverId));
                 publishMessage(get_user_queue(serverId), message, "users");
             }
         }
@@ -402,8 +408,8 @@ public:
             std::vector<std::string> mergedUsers = currentUsers;
             mergedUsers.insert(mergedUsers.end(), newUsers.begin(), newUsers.end());
             updateAllUsersFile(mergedUsers);
-            log(INFO, "S_" + std::to_string(synchID) + " consumeUserLists : added " +
-                      std::to_string(newUsers.size()) + " new users from queue: " + user_queue);
+            // log(INFO, "S_" + std::to_string(synchID) + " consumeUserLists : added " +
+            //           std::to_string(newUsers.size()) + " new users from queue: " + user_queue);
         }
         // If incoming is subset of or equal to current, do nothing - break the cycle
     }
@@ -458,7 +464,7 @@ public:
             return;
         }
 
-        log(INFO, "S_ " + std::to_string(synchID) + " publishing client follower with " + message);
+        // log(INFO, "S_ " + std::to_string(synchID) + " publishing client follower with " + message);
 
         // Publish to all synchronizers except ourselves
         ServerList allSynchronizers = getAllSynchronizers();
@@ -504,7 +510,7 @@ public:
         while (true)
         {
             std::string message = consumeMessage(consume_followers_channel);
-            log(INFO, "S_" + std::to_string(synchID) + " consuming client follower with " + message);
+            // log(INFO, "S_" + std::to_string(synchID) + " consuming client follower with " + message);
             handleFollowerMessage(message);
         }
     }
@@ -551,7 +557,7 @@ public:
             return;
         }
 
-        log(INFO, "S_ " + std::to_string(synchID) + " publishing client following with " + message);
+        // log(INFO, "S_ " + std::to_string(synchID) + " publishing client following with " + message);
 
         // Publish to all synchronizers except ourselves
         ServerList allSynchronizers = getAllSynchronizers();
@@ -598,192 +604,104 @@ public:
         while (true)
         {
             std::string message = consumeMessage(consume_following_channel);
-            log(INFO, "S_" + std::to_string(synchID) + " consuming client following : " + message);
+            // log(INFO, "S_" + std::to_string(synchID) + " consuming client following : " + message);
             handleFollowingMessage(message);
         }
     }
 
-    // for every client in your cluster, update all their followers' timeline files
-    // by publishing your user's timeline file (or just the new updates in them)
-    //  periodically to the message queue of the synchronizer responsible for that client
+    // Brute-force approach: publish ALL user timelines to ALL synchronizers
     void publishTimelines()
     {
         std::vector<std::string> users = get_all_users_func(synchID);
-        time_t currentTime = time(nullptr);
-        int timelinesPublished = 0;
-        // log(INFO, "publishTimelines Synchronizer " + std::to_string(synchID) + " for " + std::to_string(users.size()) + " users");
 
-        for (const auto &client : users)
+        if (users.empty()) {
+            return;
+        }
+
+        // Collect all timelines from all users in this synchronizer's cluster
+        Json::Value allTimelines;
+        for (const auto &user : users)
         {
-            int clientId = std::stoi(client);
-            int client_cluster = ((clientId - 1) % 3) + 1;
-            // only do this for clients in your own cluster
-            if (client_cluster != clusterID)
+            int userId = std::stoi(user);
+            // Use ReadTimelineFileWithBlanks to preserve blank lines that mark post boundaries
+            std::vector<std::string> timeline = cluster_files::ReadTimelineFileWithBlanks(
+                CurrentClusterContext(),
+                user
+            );
+            // log(INFO, "S_" + std::to_string(synchID) + " publishTimelines: User " + user + " has " + std::to_string(timeline.size()) + " timeline entries.");
+
+            if (!timeline.empty())
             {
-                continue;
-            }
-
-            // Check if timeline file was modified in the last 30 seconds
-            std::string timelineFile = get_filepath("timeline", client);
-            bool hasChangedRecently = false;
-
-            // if (stat(timelineFile.c_str(), &fileStat) == 0)
-            // {
-            //     time_t fileModTime = fileStat.st_mtime;
-
-            //     // Check if this is the first time checking this file or if it was modified in last 30 seconds
-            //     if (lastTimelineModification.find(client) == lastTimelineModification.end())
-            //     {
-            //         // First time checking this file, initialize tracking
-            //         lastTimelineModification[client] = fileModTime;
-            //         hasChangedRecently = true;
-            //     }
-            //     else if (fileModTime > lastTimelineModification[client])
-            //     {
-            //         // File was modified since last check
-            //         hasChangedRecently = true;
-            //         lastTimelineModification[client] = fileModTime;
-            //     }
-            // }
-
-            // Only proceed if timeline changed recently
-            if (!hasChangedRecently)
-            {
-                continue;
-            }
-
-            // Read the followers.txt file for this client
-            std::string followersFile = get_filepath("followers", client);
-            std::vector<std::string> followers = get_lines_from_file(followersFile, "followers", client);
-            // log(INFO, "publishTimelines num followers " + std::to_string(followers.size()) + " for user " + client.c_str());
-
-            // Only send timeline if there are followers
-            if (followers.empty())
-            {
-                continue;
-            }
-
-            std::vector<std::string> timeline = get_tl_or_fl(synchID, clientId, true);
-
-            for (const auto &follower : followers)
-            {
-                // send the timeline updates of your current user to all its followers
-                int followerId = std::stoi(follower);
-
-                // Query coordinator to find which synchronizer manages this follower
-                ClientContext context;
-                ID followerId_msg;
-                followerId_msg.set_id(followerId);
-                ServerInfo followerServerInfo;
-
-                Status status = coord_stub->GetFollowerServer(&context, followerId_msg, &followerServerInfo);
-                if (!status.ok())
-                {
-                    log(WARNING, "Failed to get follower server for client " + std::to_string(followerId) +
-                                 " from coordinator: " + status.error_message());
-                    continue;
-                }
-
-                // Determine target synchronizer based on follower's cluster and Master/Slave status
-                int follower_cluster = ((followerId - 1) % 3) + 1;
-                int target_synch;
-                if (followerServerInfo.is_master())
-                {
-                    // Follower is on Master machine, use synchronizer 1-3 based on cluster
-                    target_synch = follower_cluster;
-                }
-                else
-                {
-                    // Follower is on Slave machine, use synchronizer 4-6 based on cluster
-                    target_synch = follower_cluster + 3;
-                }
-
-                // Create JSON message with timeline data
-                Json::Value timelineMessage;
-                timelineMessage["user"] = client;
-                timelineMessage["timeline_posts"] = Json::arrayValue;
+                Json::Value userTimeline(Json::arrayValue);
                 for (const auto &post : timeline)
                 {
-                    timelineMessage["timeline_posts"].append(post);
+                    userTimeline.append(post);
                 }
-
-                Json::FastWriter writer;
-                std::string message = writer.write(timelineMessage);
-
-                // Publish to the follower's synchronizer's timeline queue
-                std::string queueName = "s_" + std::to_string(target_synch) + "_tl_Q";
-                publishMessage(queueName, message, "timeline");
-                timelinesPublished++;
-                // log(INFO, "S_ " + std::to_string(synchID) + " published timeline for user " + client +
-                //            " to synch " + std::to_string(target_synch) + " (follower " + follower + ")");
+                allTimelines[user] = userTimeline;
             }
         }
-        if (timelinesPublished > 0) {
-            log(INFO, "S_ " + std::to_string(synchID) + " published " + std::to_string(timelinesPublished) + " timelines total");
+
+        Json::FastWriter writer;
+        std::string message = writer.write(allTimelines);
+
+        if (message.empty() || message == "null") {
+            return;
+        }
+
+        // log(INFO, "S_" + std::to_string(synchID) + " publishing timelines to all synchronizers");
+
+        // Broadcast to all OTHER synchronizers
+        ServerList allSynchronizers = getAllSynchronizers();
+        for (int i = 0; i < allSynchronizers.serverid_size(); i++) {
+            int serverId = allSynchronizers.serverid(i);
+            if (serverId != synchID) {
+                std::string queueName = get_timeline_queue(serverId);
+                publishMessage(queueName, message, "timeline");
+                // log(INFO, "S_" + std::to_string(synchID) + " published timelines to S_" + std::to_string(serverId));
+            }
         }
     }
 
-    // For each client in your cluster, consume messages from your timeline queue and modify your client's timeline files based on what the users they follow posted to their timeline
+    // Brute-force approach: consume ALL timelines from all synchronizers and merge with local timelines
     void consumeTimelines()
     {
-        std::string timeline_queue = get_timeline_queue(synchID);
         std::string message = consumeMessage(consume_timeline_channel);
 
-        // log(INFO, "consumeTimelines Synchronizer " + std::to_string(synchID) + " queue: " + timeline_queue + " message size: " + std::to_string(message.size()));
+        // log(INFO, "S_" + std::to_string(synchID) + " consuming timelines from timeline queue: " + timeline_queue);
 
-        if (!message.empty())
+        if (message.empty())
         {
-            // consume the message from the queue and update the timeline file of the appropriate client with
-            // the new updates to the timeline of the user it follows
-            Json::Value root;
-            Json::Reader reader;
-            if (reader.parse(message, root))
+            return;
+        }
+
+        // Parse incoming timeline data from other synchronizer
+        Json::Value root;
+        Json::Reader reader;
+        if (!reader.parse(message, root))
+        {
+            log(WARNING, "S_" + std::to_string(synchID) + " failed to parse timeline message");
+            return;
+        }
+
+        log(INFO, "S_" + std::to_string(synchID) + " consuming timeline " + message);
+
+        // For each user in the incoming message
+        for (const auto &user_id : root.getMemberNames())
+        {
+            const Json::Value &incoming_posts = root[user_id];
+
+            // Convert JSON array to vector of strings, preserving blank lines (they mark post boundaries)
+            std::vector<std::string> incomingEntries;
+            for (const auto &post : incoming_posts)
             {
-                std::string posted_by_user = root["user"].asString();
-                std::vector<std::string> timeline_posts;
-
-                for (const auto &post : root["timeline_posts"])
-                {
-                    timeline_posts.push_back(post.asString());
-                }
-
-                int timelineUpdates = 0;
-                // For each client in our cluster, check if they follow the user who posted
-                std::vector<std::string> allUsers = get_all_users_func(synchID);
-                for (const auto &client : allUsers)
-                {
-                    std::string followingFile = get_filepath("following", client);
-                    if (file_contains_user(followingFile, posted_by_user, "following", client))
-                    {
-                        // This client follows the user who posted, update their timeline
-                        std::string timelineFile = get_filepath("timeline", client);
-                        std::string semName = get_sem_name("timeline", client);
-                        sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
-
-                        // log(INFO, "S_ " + std::to_string(synchID) + " acquiring lock (semaphore: " + semName + ")");
-                        // Wait for lock before writing
-                        sem_wait(fileSem);
-
-                        // log(INFO, "S_ " + std::to_string(synchID) + " writing to file: " + timelineFile + " (semaphore: " + semName + ")");
-                        std::ofstream timelineStream(timelineFile, std::ios::app | std::ios::out | std::ios::in);
-                        for (const auto &post : timeline_posts)
-                        {
-                            timelineStream << post << std::endl;
-                        }
-                        timelineStream.close();
-
-                        // Release lock
-                        sem_post(fileSem);
-                        sem_close(fileSem);
-                        timelineUpdates++;
-
-                    }
-                }
-                // if (timelineUpdates > 0) {
-                //     log(INFO, "S_ " + std::to_string(synchID) + " consumed timeline from user " + posted_by_user +
-                //                ", updated " + std::to_string(timelineUpdates) + " clients");
-                // }
+                std::string post_str = post.asString();
+                // Preserve both non-empty and empty strings - empty strings mark post boundaries
+                incomingEntries.push_back(post_str);
             }
+            // log(INFO, "S_" + std::to_string(synchID) + " user " + user_id + " with " + incomingEntries.size());
+            // Merge incoming timeline with local file in a thread-safe manner
+            cluster_files::mergeToTimeline(CurrentClusterContext(), user_id, incomingEntries);
+
         }
     }
 
@@ -873,15 +791,15 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
         rabbitMQ.consumeClientFollowingLoop();
     });
 
-    // std::thread timelineConsumer([&rabbitMQ]() {
-    //     rabbitMQ.consumeTimelinesLoop();
-    // });
+    std::thread timelineConsumer([&rabbitMQ]() {
+        rabbitMQ.consumeTimelinesLoop();
+    });
 
     dispatcher.detach();
     userConsumer.detach();
     followerConsumer.detach();
     followingConsumer.detach();
-    // timelineConsumer.detach();
+    timelineConsumer.detach();
 
     server->Wait();
 
@@ -979,7 +897,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         // log(INFO, "run_synchronizer Synchronizer runner thread started for synch " + std::to_string(synchID));
 
         // the synchronizers sync files every 5 seconds
-        sleep(7);
+        sleep(10);
 
         // Only publish if this is a Master synchronizer
         if (isMaster) {
@@ -993,7 +911,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
             rabbitMQ.publishClientFollowing();
 
             // Publish timelines
-            // rabbitMQ.publishTimelines();
+            rabbitMQ.publishTimelines();
         }
     }
     return;

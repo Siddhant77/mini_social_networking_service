@@ -28,6 +28,24 @@ std::string GetSemaphoreName(const ClusterFilesContext &ctx, UserFileType type, 
 
 std::vector<std::string> ReadUserFile(const ClusterFilesContext &ctx, UserFileType type, const std::string &username = "");
 
+std::vector<std::string> ReadTimelineFileWithBlanks(const ClusterFilesContext &ctx, const std::string &username);
+
+// Represents a single structured timeline post: T line, U line, W line
+struct TimelinePost {
+    std::string timestamp;  // Full T line (e.g., "T Thu Nov 27 00:52:44 2025")
+    std::string user;       // Full U line (e.g., "U 1")
+    std::string message;    // Full W line (e.g., "W p11")
+
+    // For deduplication - identify unique posts by combining all three lines
+    std::string getUniqueKey() const {
+        return timestamp + "|" + user + "|" + message;
+    }
+};
+
+std::vector<TimelinePost> ReadTimelineAsStructuredPosts(const ClusterFilesContext &ctx, const std::string &username);
+
+void WriteTimelinePost(const ClusterFilesContext &ctx, const std::string &username, const TimelinePost &post);
+
 bool FileContainsEntry(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, const std::string &value);
 
 bool AppendUniqueEntry(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, const std::string &value);
@@ -37,6 +55,8 @@ bool RemoveEntry(const ClusterFilesContext &ctx, UserFileType type, const std::s
 std::size_t WriteAllUsers(const ClusterFilesContext &ctx, const std::vector<std::string> &users);
 
 bool NeedToSynch(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, int seconds);
+
+void mergeToTimeline(const ClusterFilesContext &ctx, const std::string &username, const std::vector<std::string> &incomingEntries);
 
 } // namespace cluster_files
 

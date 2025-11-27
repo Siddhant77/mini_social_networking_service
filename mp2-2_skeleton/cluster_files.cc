@@ -9,6 +9,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <ctime>
+#include <iostream>
 
 namespace fs = std::filesystem;
 
@@ -131,6 +132,77 @@ std::vector<std::string> ReadUserFile(const ClusterFilesContext &ctx, UserFileTy
     return entries;
 }
 
+std::vector<std::string> ReadTimelineFileWithBlanks(const ClusterFilesContext &ctx, const std::string &username) {
+    std::vector<std::string> entries;
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    std::string sem_name = GetSemaphoreName(ctx, UserFileType::kTimeline, username);
+    FileSemaphoreLock lock(sem_name);
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return entries;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Preserve blank lines for timeline files (they mark post boundaries)
+        entries.push_back(line);
+    }
+
+    return entries;
+}
+
+std::vector<TimelinePost> ReadTimelineAsStructuredPosts(const ClusterFilesContext &ctx, const std::string &username) {
+    std::vector<TimelinePost> posts;
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    std::string sem_name = GetSemaphoreName(ctx, UserFileType::kTimeline, username);
+    FileSemaphoreLock lock(sem_name);
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return posts;
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        lines.push_back(line);
+    }
+
+    // Parse posts: each post is T line, U line, W line, blank line
+    // Process backwards like tsd.cc does, but we'll process forward for simplicity
+    for (std::size_t i = 0; i + 3 < lines.size(); i += 4) {
+        // Check if we have a valid post structure: T, U, W, blank
+        if (lines[i].size() >= 2 && lines[i].substr(0, 2) == "T " &&
+            lines[i+1].size() >= 2 && lines[i+1].substr(0, 2) == "U " &&
+            lines[i+2].size() >= 2 && lines[i+2].substr(0, 2) == "W " &&
+            lines[i+3].empty()) {
+
+            TimelinePost post;
+            post.timestamp = lines[i];
+            post.user = lines[i+1];
+            post.message = lines[i+2];
+            posts.push_back(post);
+        }
+    }
+
+    return posts;
+}
+
+void WriteTimelinePost(const ClusterFilesContext &ctx, const std::string &username, const TimelinePost &post) {
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    std::string sem_name = GetSemaphoreName(ctx, UserFileType::kTimeline, username);
+    FileSemaphoreLock lock(sem_name);
+
+    std::ofstream file(path, std::ios::app);
+    if (file.is_open()) {
+        file << post.timestamp << std::endl;
+        file << post.user << std::endl;
+        file << post.message << std::endl;
+        file << std::endl;  // Blank line
+    }
+}
+
 bool FileContainsEntry(const ClusterFilesContext &ctx, UserFileType type, const std::string &username, const std::string &value) {
     std::vector<std::string> entries = ReadUserFile(ctx, type, username);
     for (const auto &entry : entries) {
@@ -247,4 +319,80 @@ bool NeedToSynch(const ClusterFilesContext &ctx, UserFileType type, const std::s
     return duration.count() < seconds;
 }
 
-} // namespace cluster_files
+void mergeToTimeline(const ClusterFilesContext &ctx, const std::string &username, const std::vector<std::string> &incomingEntries) {
+    // Read existing posts from file
+    std::vector<TimelinePost> existingPosts = ReadTimelineAsStructuredPosts(ctx, username);
+
+    // Track unique posts by their full content
+    std::unordered_set<std::string> seenPostKeys;
+    for (const auto &post : existingPosts) {
+        seenPostKeys.insert(post.getUniqueKey());
+    }
+
+    // Parse incoming entries into posts (T-U-W blocks with blank lines)
+    std::vector<TimelinePost> incomingPosts;
+    std::vector<std::string> currentPostLines;
+
+    for (const auto &entry : incomingEntries) {
+        if (entry.empty()) {
+            // Blank line marks end of post
+            if (currentPostLines.size() == 3 &&
+                currentPostLines[0].size() >= 2 && currentPostLines[0].substr(0, 2) == "T " &&
+                currentPostLines[1].size() >= 2 && currentPostLines[1].substr(0, 2) == "U " &&
+                currentPostLines[2].size() >= 2 && currentPostLines[2].substr(0, 2) == "W ") {
+
+                TimelinePost post;
+                post.timestamp = currentPostLines[0];
+                post.user = currentPostLines[1];
+                post.message = currentPostLines[2];
+                incomingPosts.push_back(post);
+            }
+            currentPostLines.clear();
+        } else {
+            currentPostLines.push_back(entry);
+        }
+    }
+    // Handle last post if it doesn't end with blank line
+    if (currentPostLines.size() == 3 &&
+        currentPostLines[0].size() >= 2 && currentPostLines[0].substr(0, 2) == "T " &&
+        currentPostLines[1].size() >= 2 && currentPostLines[1].substr(0, 2) == "U " &&
+        currentPostLines[2].size() >= 2 && currentPostLines[2].substr(0, 2) == "W ") {
+
+        TimelinePost post;
+        post.timestamp = currentPostLines[0];
+        post.user = currentPostLines[1];
+        post.message = currentPostLines[2];
+        incomingPosts.push_back(post);
+    }
+
+    // Find new posts to add
+    std::vector<TimelinePost> newPosts;
+    for (const auto &post : incomingPosts) {
+        if (seenPostKeys.find(post.getUniqueKey()) == seenPostKeys.end()) {
+            newPosts.push_back(post);
+            seenPostKeys.insert(post.getUniqueKey());
+        }
+    }
+
+    // If no new posts were added, data is stale - return without writing
+    if (newPosts.empty()) {
+        return;
+    }
+
+    // Append new posts to timeline file
+    std::string path = GetFilePath(ctx, UserFileType::kTimeline, username);
+    std::string sem_name = GetSemaphoreName(ctx, UserFileType::kTimeline, username);
+    FileSemaphoreLock lock(sem_name);
+
+    std::ofstream file(path, std::ios::app);
+    if (file.is_open()) {
+        for (const auto &post : newPosts) {
+            file << post.timestamp << std::endl;
+            file << post.user << std::endl;
+            file << post.message << std::endl;
+            file << std::endl;  // Blank line between posts
+        }
+    }
+}
+
+}  // namespace cluster_files

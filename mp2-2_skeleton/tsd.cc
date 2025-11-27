@@ -251,7 +251,7 @@ void broadcast_to_followers(const std::string& username, const Message& message)
 // Helper function to write message to file in the required format
 void write_message_to_file(const std::string& username, const Message& message) {
   EnsureServerDirectory();
-  std::string filename = server_directory + "/" + username + ".txt";
+  std::string filename = server_directory + "/" + username + "_timeline.txt";
   std::ofstream file(filename, std::ios::app);
 
   if (file.is_open()) {
@@ -317,7 +317,7 @@ std::vector<Message> read_last_messages(
   {
   std::vector<Message> messages;
   EnsureServerDirectory();
-  std::string filename = server_directory + "/" + username + ".txt";
+  std::string filename = server_directory + "/" + username + "_timeline.txt";
   std::ifstream file(filename);
 
   if (!file.is_open()) {
